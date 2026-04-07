@@ -1,0 +1,28 @@
+{
+  "agent": {
+    "type": "claude"
+  },
+  "claude": {
+    "model": "claude-sonnet-4-6",
+    "max_tokens": 16384,
+    "permission_mode": "accept_edits"
+  },
+  "vault": {
+    "root": "vault"
+  },
+  "git": {
+    "auto_commit": true,
+    "commit_message_prefix": "[VibeSwipe] "
+  },
+  "ui": {
+    "max_agents_per_project": 8,
+    "suggestions_count": 4
+  },
+  "personalization": {
+    "recency_half_life_days": 7.0,
+    "decay_interval_hours": 24,
+    "project_affinity_weight": 0.4,
+    "recency_weight": 0.35,
+    "frequency_weight": 0.25
+  }
+}

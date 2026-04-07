@@ -1,0 +1,2061 @@
+"""VibeSwipe TUI — modal, keyboard-first multi-project Claude Code interface.
+
+Modes
+─────
+  Command mode  (default)  — single key shortcuts, no typing
+  Prompt mode              — typing a prompt for a new agent  (n or Enter)
+  Edit mode                — typing in the file editor        (i to enter)
+
+Command mode keys
+─────────────────
+  ]  /  [       next / prev project
+  1 … 9         jump to project by number
+  n  or  Enter  open prompt to start a new agent
+  x             cancel last running agent
+  d             close / dismiss last agent widget
+  j / k         scroll agent list down / up
+  e             toggle editor panel (read-only view)
+  i             enter file edit mode  (only when editor is visible)
+  m             toggle memory / knowledge graph
+  t             toggle terminal panel (show/hide, or focus when open)
+  r             run last detected shell command in terminal
+  s             save file  (only in edit mode)
+  q             quit
+  Escape / Backspace / ,   back to command mode
+
+Prompt mode  (Input focused)
+─────────────────────────────
+  type freely   builds the prompt
+  Tab           cycle through suggestions
+  Enter         submit → launch Claude agent
+  Escape / ,    back to command mode  (comma only when Input is empty)
+
+Edit mode  (TextArea focused, editable)
+────────────────────────────────────────
+  type freely   edits the file
+  Escape        save + back to command mode
+"""
+from __future__ import annotations
+
+import asyncio
+import os
+import subprocess
+import sys
+from pathlib import Path
+from typing import ClassVar
+
+from textual.app import App, ComposeResult
+from textual.binding import Binding
+from textual.containers import Horizontal, ScrollableContainer, Container, Vertical
+from textual.events import Key
+from textual.message import Message
+from textual.reactive import reactive
+from textual.screen import ModalScreen
+from textual.widgets import (
+    Button, DirectoryTree, Footer, Input, Label, RichLog, Static, TextArea, Tree,
+)
+from textual import work, on
+
+from core.project_manager import Project, ProjectManager
+from terminal.agent_session import AgentSession
+from terminal.claude_session import ClaudeSession, PERMISSION_FLAGS
+from terminal.codex_session import CodexSession
+from terminal.cursor_session import CursorSession
+from terminal.pty_widget import PTYWidget
+from terminal.approval_server import ApprovalServer
+from claude.suggestion_engine import PromptSuggestionEngine
+from claude.sdk_client import ClaudeSDKClient
+from claude.profile_analyzer import ProfileAnalyzer
+from graph.personalization_graph import PersonalizationGraph
+from memory.vault import MemoryVault
+from memory.moc import MOCManager
+from memory.run_log import RunLogger
+from memory.user_profile import UserProfile
+from memory.linter import VaultLinter
+from memory.linker import Linker
+
+
+# ---------------------------------------------------------------------------
+# Messages
+# ---------------------------------------------------------------------------
+
+class PromptSubmitted(Message):
+    def __init__(self, prompt: str) -> None:
+        self.prompt = prompt
+        super().__init__()
+
+
+class CommandDetected(Message):
+    """Emitted by AgentWidget when a shell command is found in output."""
+    def __init__(self, cmd: str) -> None:
+        self.cmd = cmd
+        super().__init__()
+
+
+# ---------------------------------------------------------------------------
+# SelectableLog — TextArea subclass that copies to the system clipboard
+# ---------------------------------------------------------------------------
+
+class SelectableLog(TextArea):
+    """
+    Read-only TextArea for agent output.
+
+    Cmd+C / Ctrl+C copies the current selection (or all text if nothing is
+    selected) to the system clipboard via:
+      1. OSC 52 terminal escape (works in iTerm2, Alacritty, tmux, …)
+      2. pbcopy  fallback for macOS Terminal.app
+      3. xclip   fallback for Linux
+    """
+
+    def action_copy(self) -> None:
+        text = self.selected_text or self.text
+        if not text:
+            return
+        # OSC 52 (most modern terminals incl. iTerm2)
+        self.app.copy_to_clipboard(text)
+        # pbcopy / xclip fallback so Terminal.app also works
+        try:
+            if sys.platform == "darwin":
+                subprocess.run(
+                    ["pbcopy"], input=text.encode(),
+                    capture_output=True, timeout=3, check=False,
+                )
+            elif sys.platform.startswith("linux"):
+                subprocess.run(
+                    ["xclip", "-selection", "clipboard"],
+                    input=text.encode(),
+                    capture_output=True, timeout=3, check=False,
+                )
+        except Exception:
+            pass
+
+
+# ---------------------------------------------------------------------------
+# AgentMemoryWidget — vault notes related to an agent's prompt
+# ---------------------------------------------------------------------------
+
+class AgentMemoryWidget(Static):
+    """Shows vault notes related to the agent's prompt."""
+
+    DEFAULT_CSS = """
+    AgentMemoryWidget {
+        height: auto;
+        color: $text-muted;
+        padding: 0 1;
+        background: $surface;
+    }
+    """
+
+    def __init__(self, prompt: str, vault: "MemoryVault | None", **kwargs) -> None:
+        super().__init__(**kwargs)
+        self._prompt = prompt
+        self._vault = vault
+
+    def on_mount(self) -> None:
+        self._populate()
+
+    def _populate(self) -> None:
+        if not self._vault:
+            self.update("[dim]♦ Memory: (no vault)[/dim]")
+            return
+        keywords = [w for w in self._prompt.split() if len(w) > 3][:6]
+        seen: set[str] = set()
+        for kw in keywords:
+            for note in self._vault.search(kw)[:2]:
+                seen.add(note.title)
+        if seen:
+            links = "  ".join(f"[[{t}]]" for t in list(seen)[:4])
+            self.update(f"[dim]♦ Memory: {links}[/dim]")
+        else:
+            self.update("[dim]♦ Memory: (no related notes)[/dim]")
+
+
+# ---------------------------------------------------------------------------
+# PermissionPrompt — inline approve/deny widget inside an AgentWidget
+# ---------------------------------------------------------------------------
+
+class PermissionPrompt(Static, can_focus=True):
+    """
+    Inline permission-request widget with keyboard-navigable text options.
+
+    ◄/► or h/l     move selection between options
+    Enter / y       confirm selected option
+    n               jump to Deny and confirm
+
+    Options:  [0] Approve   [1] Approve+Remember   [2] Deny
+    """
+
+    DEFAULT_CSS = """
+    PermissionPrompt {
+        border: solid $warning;
+        background: $surface-darken-2;
+        padding: 1 2;
+        height: auto;
+        margin: 1 0;
+    }
+    PermissionPrompt:focus { border: solid $accent; }
+    .pp-tool-line { color: $warning;    height: 1; }
+    .pp-detail    { color: $text-muted; height: 1; }
+    .pp-options   { height: 1; margin-top: 1; }
+    .pp-hint      { color: $text-muted; height: 1; }
+    """
+
+    # Option definitions: (label, allow, always)
+    _OPTIONS: list[tuple[str, bool, bool]] = [
+        ("Approve",           True,  False),
+        ("Approve+Remember",  True,  True),
+        ("Deny",              False, False),
+    ]
+
+    class Decision(Message):
+        """Bubbles to the App when the user makes a decision."""
+        def __init__(
+            self,
+            agent_widget: "AgentWidget",
+            session: AgentSession,
+            request_id: str,
+            tool_name: str,
+            tool_detail: str,
+            allow: bool,
+            always: bool,
+        ) -> None:
+            self.agent_widget = agent_widget
+            self.session      = session
+            self.request_id   = request_id
+            self.tool_name    = tool_name
+            self.tool_detail  = tool_detail
+            self.allow        = allow
+            self.always       = always
+            super().__init__()
+
+    def __init__(
+        self,
+        agent_widget: "AgentWidget",
+        session: AgentSession,
+        request: dict,
+        **kwargs,
+    ) -> None:
+        super().__init__(**kwargs)
+        self._agent   = agent_widget
+        self._session = session
+        self._request = request
+        self._sel     = 0   # currently highlighted option index
+
+    def compose(self) -> ComposeResult:
+        tool   = self._request.get("tool_name", "unknown")
+        inp    = self._request.get("tool_input", {})
+        detail = (
+            inp.get("command")
+            or inp.get("file_path")
+            or inp.get("path")
+            or self._request.get("_text", "")
+        )[:80]
+        yield Label(f" Claude wants to use: [bold]{tool}[/bold]", classes="pp-tool-line")
+        if detail:
+            yield Label(f" {detail}", classes="pp-detail")
+        yield Static(self._render_options(), id="pp-options", classes="pp-options")
+        yield Label(" ◄/► select  Enter=confirm  y=approve  n=deny", classes="pp-hint")
+
+    def on_mount(self) -> None:
+        self.focus()
+
+    def _render_options(self) -> str:
+        parts = []
+        for i, (label, _, _) in enumerate(self._OPTIONS):
+            if i == self._sel:
+                if i == 2:   # Deny
+                    parts.append(f"[bold red]❯ {label}[/bold red]")
+                elif i == 1:  # Approve+Remember
+                    parts.append(f"[bold yellow]❯ {label}[/bold yellow]")
+                else:         # Approve
+                    parts.append(f"[bold green]❯ {label}[/bold green]")
+            else:
+                parts.append(f"[dim]  {label}[/dim]")
+        return "   ".join(parts)
+
+    def _refresh_options(self) -> None:
+        self.query_one("#pp-options", Static).update(self._render_options())
+
+    def on_key(self, event: Key) -> None:
+        key = event.key
+        if key in ("right", "l"):
+            self._sel = (self._sel + 1) % len(self._OPTIONS)
+            self._refresh_options()
+            event.stop()
+        elif key in ("left", "h"):
+            self._sel = (self._sel - 1) % len(self._OPTIONS)
+            self._refresh_options()
+            event.stop()
+        elif key in ("enter", "y"):
+            if key == "y":
+                self._sel = 0   # Approve
+            self._confirm()
+            event.stop()
+        elif key == "n":
+            self._sel = 2       # Deny
+            self._confirm()
+            event.stop()
+
+    def _confirm(self) -> None:
+        label, allow, always = self._OPTIONS[self._sel]
+        tool   = self._request.get("tool_name", "unknown")
+        rid    = self._request.get("request_id", "")
+        inp    = self._request.get("tool_input", {})
+        detail = (inp.get("command") or inp.get("file_path") or inp.get("path") or "")[:80]
+        self.remove()
+        self.post_message(
+            self.Decision(self._agent, self._session, rid, tool, detail, allow, always)
+        )
+
+
+# ---------------------------------------------------------------------------
+# AgentWidget — one Claude session
+# ---------------------------------------------------------------------------
+
+class AgentWidget(Static):
+    """
+    Displays a Claude agent conversation.
+
+    During a run: RichLog streams output (fast).
+    After completion: TextArea (read-only) replaces the log so the user can
+    select and copy text with standard keyboard shortcuts (Ctrl/Cmd+C).
+    Replies append to the same box via --resume; no new widget is created.
+    """
+
+    DEFAULT_CSS = """
+    AgentWidget {
+        border: solid $primary-darken-2;
+        margin: 0 0 1 0;
+        height: auto;
+        min-height: 7;
+        max-height: 36;
+    }
+    .agent-header {
+        background: $surface;
+        color: $text-muted;
+        height: 1;
+        padding: 0 1;
+    }
+    .agent-log { height: 12; background: $background; }
+    .agent-ta  {
+        height: 12;
+        background: $background;
+        border: none;
+        padding: 0;
+    }
+    .agent-status-running { color: $warning;  height: 1; padding: 0 1; }
+    .agent-status-done    { color: $success;  height: 1; padding: 0 1; }
+    .agent-status-error   { color: $error;    height: 1; padding: 0 1; }
+    .agent-reply {
+        height: 3;
+        border: tall $accent-darken-2;
+        background: $surface;
+        display: none;
+    }
+    """
+
+    class Complete(Message):
+        def __init__(self, agent_widget: "AgentWidget", exit_code: int) -> None:
+            self.agent_widget = agent_widget
+            self.exit_code = exit_code
+            super().__init__()
+
+    def __init__(self, session: AgentSession, number: int,
+                 vault: "MemoryVault | None" = None, **kwargs) -> None:
+        super().__init__(**kwargs)
+        self.session  = session          # original session — stable, never replaced
+        self.number   = number
+        self._vault   = vault
+        self._log:    RichLog | None = None
+        self._ta:     SelectableLog | None = None
+        self._status: Label | None = None
+        self._in_code_fence = False
+        self._fence_lang    = ""
+        self._full_lines:   list[str] = []   # accumulates all output for TextArea
+        self._active_session: AgentSession = session  # latest session (updated on reply)
+
+    def compose(self) -> ComposeResult:
+        sid   = self.session.session_id
+        short = self.session.prompt[:55] + ("…" if len(self.session.prompt) > 55 else "")
+        yield Label(f"[bold]#{self.number}[/bold]  {short}", classes="agent-header")
+        yield RichLog(id=f"agent-log-{sid}", wrap=True, highlight=False,
+                      markup=False, classes="agent-log")
+        yield SelectableLog("", read_only=True, id=f"agent-ta-{sid}", classes="agent-ta")
+        yield Label("⟳ Running…", classes="agent-status-running",
+                    id=f"agent-status-{sid}")
+        yield Input(
+            placeholder="↵ reply… (/btw context · /compact · follow-up)",
+            id=f"agent-reply-{sid}",
+            classes="agent-reply",
+        )
+        yield AgentMemoryWidget(self.session.prompt, self._vault,
+                                id=f"agent-mem-{sid}")
+
+    def on_mount(self) -> None:
+        sid          = self.session.session_id
+        self._log    = self.query_one(f"#agent-log-{sid}",    RichLog)
+        self._ta     = self.query_one(f"#agent-ta-{sid}",     SelectableLog)
+        self._status = self.query_one(f"#agent-status-{sid}", Label)
+        self._ta.display = False          # hidden until first completion
+        self._run_session()
+
+    # ------------------------------------------------------------------ streaming
+
+    @work(exclusive=False)
+    async def _run_session(self) -> None:
+        exit_code = await self._stream(self.session)
+        self._mark_complete(exit_code)
+
+    async def _stream(self, session: ClaudeSession) -> int:
+        """Stream a session into the RichLog, return exit code."""
+        def append(line: str) -> None:
+            self._full_lines.append(line)
+            if self._log is not None:
+                self._log.write(line)
+            cmd = self._check_for_command(line)
+            if cmd:
+                self.post_message(CommandDetected(cmd))
+
+        def on_perm(request: dict) -> None:
+            prompt_widget = PermissionPrompt(self, session, request)
+            if self._status:
+                self.mount(prompt_widget, before=self._status)
+
+        return await session.run(on_line=append, on_permission_request=on_perm)
+
+    # ------------------------------------------------------------------ completion
+
+    def _mark_complete(self, exit_code: int) -> None:
+        sid = self.session.session_id
+
+        if self._status:
+            if exit_code == 0:
+                self._status.update(f"✓ Done  ({self._active_session.elapsed:.1f}s)")
+                self._status.remove_class("agent-status-running")
+                self._status.add_class("agent-status-done")
+            else:
+                self._status.update(f"✗ Failed (exit {exit_code})")
+                self._status.remove_class("agent-status-running")
+                self._status.add_class("agent-status-error")
+
+        # Switch to selectable TextArea
+        if self._log and self._ta:
+            self._log.display = False
+            self._ta.load_text("\n".join(self._full_lines))
+            self._ta.display = True
+            self._ta.scroll_end(animate=False)
+
+        # Show reply input
+        reply_input = self.query_one(f"#agent-reply-{sid}", Input)
+        reply_input.display = True
+
+        self.post_message(self.Complete(self, exit_code))
+
+    # ------------------------------------------------------------------ reply / multi-turn
+
+    @on(Input.Submitted)
+    def _reply_submitted(self, event: Input.Submitted) -> None:
+        if not (event.input.id or "").startswith("agent-reply-"):
+            return
+        reply = event.value.strip()
+        if not reply:
+            return
+        event.input.value = ""
+        self._run_reply(reply)
+
+    @work(exclusive=False)
+    async def _run_reply(self, reply: str) -> None:
+        """Continue the conversation in-place."""
+        sid = self.session.session_id
+
+        # Switch back to streaming log
+        if self._ta and self._log:
+            self._ta.display = False
+            self._log.display = True
+
+        # Show separator in log
+        sep = f"─── ↵ {reply[:60]} ───"
+        self._full_lines += ["", sep, ""]
+        if self._log:
+            self._log.write("")
+            self._log.write(sep)
+            self._log.write("")
+
+        # Reset status to running
+        if self._status:
+            self._status.update("⟳ Running…")
+            self._status.remove_class("agent-status-done", "agent-status-error")
+            self._status.add_class("agent-status-running")
+
+        # Hide reply input while running
+        reply_input = self.query_one(f"#agent-reply-{sid}", Input)
+        reply_input.display = False
+
+        # Preserve the same agent type (Claude/Codex/Cursor) for the continuation
+        session_cls = type(self._active_session)
+        continuation = session_cls(
+            prompt=reply,
+            project_path=self._active_session.project_path,
+            permission_mode=self._active_session.permission_mode,
+            resume_session_id=self._active_session.captured_session_id,
+        )
+        self._active_session = continuation
+
+        exit_code = await self._stream(continuation)
+        self._mark_complete(exit_code)
+
+    # ------------------------------------------------------------------ helpers
+
+    def _check_for_command(self, line: str) -> str | None:
+        stripped = line.strip()
+        if stripped.startswith("```"):
+            if self._in_code_fence:
+                self._in_code_fence = False
+                self._fence_lang = ""
+            else:
+                lang = stripped[3:].lower().strip()
+                self._in_code_fence = lang in ("bash", "shell", "sh", "zsh")
+                self._fence_lang = lang
+            return None
+        if self._in_code_fence and stripped:
+            return stripped
+        if stripped.startswith("$ "):
+            return stripped[2:]
+        return None
+
+
+# ---------------------------------------------------------------------------
+# AgentPanel
+# ---------------------------------------------------------------------------
+
+class AgentPanel(Static, can_focus=True):
+    """
+    Scrollable stack of agent widgets, isolated per project.
+    Each project gets its own ScrollableContainer; switching projects
+    hides the old one and shows (or creates) the new one.
+    can_focus=True so it holds focus in command mode (keys bubble to App).
+    """
+
+    DEFAULT_CSS = """
+    AgentPanel {
+        width: 1fr;
+        background: $surface;
+    }
+    .ap-header {
+        height: 1;
+        background: $primary-darken-3;
+        color: $text-muted;
+        padding: 0 1;
+    }
+    .ap-scroll { height: 1fr; }
+    .ap-empty {
+        color: $text-muted;
+        padding: 1 2;
+    }
+    """
+
+    class AgentComplete(Message):
+        def __init__(self, agent_widget: AgentWidget, exit_code: int) -> None:
+            self.agent_widget = agent_widget
+            self.exit_code = exit_code
+            super().__init__()
+
+    def __init__(self, **kwargs) -> None:
+        super().__init__(**kwargs)
+        self._active_project: str = ""
+        self._project_counts: dict[str, int] = {}
+
+    def compose(self) -> ComposeResult:
+        yield Label(" AGENTS  [dim](n = new prompt · x = cancel · d = close · j/k = scroll)[/dim]",
+                    classes="ap-header")
+        # Per-project ScrollableContainers are created lazily in switch_project()
+
+    @staticmethod
+    def _safe_id(project_name: str) -> str:
+        import re as _re
+        return _re.sub(r"[^a-zA-Z0-9_-]", "_", project_name)
+
+    def _container_id(self, project_name: str) -> str:
+        return f"ap-scroll-{self._safe_id(project_name)}"
+
+    def switch_project(self, project_name: str) -> None:
+        """Hide all project containers and show (or create) the one for project_name."""
+        for c in self.query(".ap-project-scroll"):
+            c.display = False
+
+        cid = self._container_id(project_name)
+        try:
+            container = self.query_one(f"#{cid}", ScrollableContainer)
+        except Exception:
+            container = ScrollableContainer(id=cid, classes="ap-scroll ap-project-scroll")
+            self.mount(container)
+            container.mount(Static(
+                "  No agents yet.\n\n  Press [bold]n[/bold] or [bold]Enter[/bold] to type a prompt.",
+                classes="ap-empty ap-empty-hint",
+            ))
+
+        container.display = True
+        self._active_project = project_name
+        self._update_hint()
+
+    def _active_container(self) -> ScrollableContainer:
+        cid = self._container_id(self._active_project)
+        return self.query_one(f"#{cid}", ScrollableContainer)
+
+    def _update_hint(self) -> None:
+        """Show or hide the empty hint based on whether any AgentWidgets exist."""
+        try:
+            container = self._active_container()
+        except Exception:
+            return
+        has_agents = bool(list(container.query(AgentWidget)))
+        for hint in container.query(".ap-empty-hint"):
+            hint.display = not has_agents
+
+    def add_agent(self, session: AgentSession,
+                  vault: "MemoryVault | None" = None) -> AgentWidget:
+        container = self._active_container()
+        self._project_counts[self._active_project] = (
+            self._project_counts.get(self._active_project, 0) + 1
+        )
+        count  = self._project_counts[self._active_project]
+        widget = AgentWidget(session, number=count, vault=vault,
+                             id=f"agent-{session.session_id}")
+        container.mount(widget)
+        container.scroll_end(animate=False)
+        self._update_hint()
+        return widget
+
+    def remove_last(self) -> None:
+        try:
+            container = self._active_container()
+        except Exception:
+            return
+        agents = list(container.query(AgentWidget))
+        if agents:
+            agents[-1].remove()
+            prev = self._project_counts.get(self._active_project, 0)
+            self._project_counts[self._active_project] = max(0, prev - 1)
+        self._update_hint()
+
+    def cancel_last(self) -> None:
+        try:
+            container = self._active_container()
+        except Exception:
+            return
+        agents = list(container.query(AgentWidget))
+        for w in reversed(agents):
+            if not w.session.is_done:
+                w.session.cancel()
+                break
+
+    def cancel_all(self) -> None:
+        """Cancel every running agent across all projects."""
+        for w in self.query(AgentWidget):
+            w.session.cancel()
+
+    def active_agents(self) -> list["AgentWidget"]:
+        """Return AgentWidgets for the currently active project."""
+        try:
+            return list(self._active_container().query(AgentWidget))
+        except Exception:
+            return []
+
+    def scroll_down(self) -> None:
+        try:
+            self._active_container().scroll_down()
+        except Exception:
+            pass
+
+    def scroll_up(self) -> None:
+        try:
+            self._active_container().scroll_up()
+        except Exception:
+            pass
+
+    @on(AgentWidget.Complete)
+    def _bubble(self, event: AgentWidget.Complete) -> None:
+        self.post_message(self.AgentComplete(event.agent_widget, event.exit_code))
+
+
+# ---------------------------------------------------------------------------
+# TerminalPanel
+# ---------------------------------------------------------------------------
+
+class TerminalPanel(Static):
+    """
+    Embedded real PTY terminal panel, isolated per project.
+
+    Each project gets its own PTYWidget; switching projects hides the old
+    one and shows (or creates) the new one.  Press ctrl+t to toggle.
+    """
+
+    DEFAULT_CSS = """
+    TerminalPanel {
+        height: 18;
+        border-top: solid $primary-darken-2;
+        background: $background;
+    }
+    .tp-header { height: 1; background: $primary-darken-3; color: $text-muted; padding: 0 1; }
+    PTYWidget   { height: 1fr; }
+    """
+
+    def __init__(self, **kwargs) -> None:
+        super().__init__(**kwargs)
+        self._active_project: str = ""
+
+    def compose(self) -> ComposeResult:
+        yield Label(
+            " TERMINAL  [dim](ctrl+t to close)[/dim]",
+            classes="tp-header",
+        )
+        # Per-project PTYWidgets are created lazily in switch_project()
+
+    @staticmethod
+    def _safe_id(project_name: str) -> str:
+        import re as _re
+        return _re.sub(r"[^a-zA-Z0-9_-]", "_", project_name)
+
+    def _pty_id(self, project_name: str) -> str:
+        return f"tp-pty-{self._safe_id(project_name)}"
+
+    def switch_project(self, project_name: str, cwd: str) -> None:
+        """Hide all PTY widgets and show (or create) the one for project_name."""
+        for pty in self.query(PTYWidget):
+            pty.display = False
+
+        pid = self._pty_id(project_name)
+        try:
+            pty = self.query_one(f"#{pid}", PTYWidget)
+        except Exception:
+            pty = PTYWidget(cwd=cwd, id=pid)
+            self.mount(pty)
+
+        pty.display = True
+        self._active_project = project_name
+
+    def _active_pty(self) -> PTYWidget:
+        return self.query_one(f"#{self._pty_id(self._active_project)}", PTYWidget)
+
+    def focus_input(self) -> None:
+        try:
+            self._active_pty().focus()
+        except Exception:
+            pass
+
+    def run_command(self, cmd: str) -> None:
+        """Type a command and press Enter in the active terminal."""
+        try:
+            self._active_pty().run_command(cmd)
+        except Exception:
+            pass
+
+
+# ---------------------------------------------------------------------------
+# FileBrowserPanel — directory tree for the active project
+# ---------------------------------------------------------------------------
+
+class FileBrowserPanel(Static):
+    """Left sidebar with a DirectoryTree for the active project. Toggle with f."""
+
+    DEFAULT_CSS = """
+    FileBrowserPanel {
+        width: 26;
+        border-right: solid $primary-darken-2;
+        background: $surface;
+    }
+    .fb-header {
+        height: 1;
+        background: $primary-darken-3;
+        color: $text-muted;
+        padding: 0 1;
+    }
+    .fb-tree { height: 1fr; }
+    .fb-footer {
+        height: 1;
+        background: $surface;
+        color: $text-muted;
+        padding: 0 1;
+    }
+    """
+
+    class FileSelected(Message):
+        def __init__(self, path: str) -> None:
+            self.path = path
+            super().__init__()
+
+    def __init__(self, root: str = ".", **kwargs) -> None:
+        super().__init__(**kwargs)
+        self._root = root
+
+    def compose(self) -> ComposeResult:
+        yield Label(" FILES  [dim](f=close · Enter=open)[/dim]", classes="fb-header")
+        yield DirectoryTree(self._root, id="fb-tree", classes="fb-tree")
+        yield Label(" ↑↓ navigate · Enter open file", classes="fb-footer")
+
+    def set_root(self, path: str) -> None:
+        self._root = path
+        tree = self.query_one("#fb-tree", DirectoryTree)
+        tree.path = Path(path)
+
+    def focus_tree(self) -> None:
+        self.query_one("#fb-tree", DirectoryTree).focus()
+
+    @on(DirectoryTree.FileSelected)
+    def _file_selected(self, event: DirectoryTree.FileSelected) -> None:
+        self.post_message(self.FileSelected(str(event.path)))
+
+
+# ---------------------------------------------------------------------------
+# EditorPanel
+# ---------------------------------------------------------------------------
+
+class EditorPanel(Static):
+    """Read-only file viewer; press i to enter edit mode."""
+
+    DEFAULT_CSS = """
+    EditorPanel {
+        width: 50%;
+        border-right: solid $primary-darken-2;
+        background: $background;
+    }
+    .ep-header {
+        height: 1;
+        background: $primary-darken-3;
+        color: $text-muted;
+        padding: 0 1;
+    }
+    .ep-area { height: 1fr; }
+    """
+
+    def __init__(self, **kwargs) -> None:
+        super().__init__(**kwargs)
+        self._current_path = ""
+
+    def compose(self) -> ComposeResult:
+        yield Label(" (no file)  [dim]e=close · i=edit[/dim]",
+                    id="ep-label", classes="ep-header")
+        yield TextArea("", id="ep-area", classes="ep-area",
+                       read_only=True, show_line_numbers=True)
+
+    def load_file(self, path: str) -> None:
+        self._current_path = path
+        label = self.query_one("#ep-label", Label)
+        label.update(f" {os.path.basename(path)}  [dim](read-only · i=edit)[/dim]")
+        try:
+            content = Path(path).read_text(errors="replace")
+        except Exception as e:
+            content = f"[Error: {e}]"
+        ta = self.query_one("#ep-area", TextArea)
+        ta.language = _language_for(path)
+        ta.load_text(content)
+        ta.read_only = True
+
+    def enter_edit_mode(self) -> None:
+        ta = self.query_one("#ep-area", TextArea)
+        ta.read_only = False
+        ta.focus()
+        label = self.query_one("#ep-label", Label)
+        label.update(f" {os.path.basename(self._current_path)}  "
+                     "[bold yellow]EDIT[/bold yellow]  [dim](Escape=save+exit)[/dim]")
+
+    def exit_edit_mode(self) -> None:
+        ta = self.query_one("#ep-area", TextArea)
+        ta.read_only = True
+        label = self.query_one("#ep-label", Label)
+        label.update(f" {os.path.basename(self._current_path)}  [dim](read-only · i=edit)[/dim]")
+        self.save()
+
+    def save(self) -> bool:
+        if not self._current_path:
+            return False
+        ta = self.query_one("#ep-area", TextArea)
+        try:
+            Path(self._current_path).write_text(ta.text)
+            return True
+        except Exception:
+            return False
+
+    @property
+    def is_in_edit_mode(self) -> bool:
+        ta = self.query_one("#ep-area", TextArea)
+        return not ta.read_only
+
+    @property
+    def current_path(self) -> str:
+        return self._current_path
+
+
+# ---------------------------------------------------------------------------
+# GraphPane
+# ---------------------------------------------------------------------------
+
+class GraphPane(Static):
+    """Memory / knowledge graph as a navigable tree. Toggle with m."""
+
+    DEFAULT_CSS = """
+    GraphPane {
+        width: 1fr;
+        height: 1fr;
+        background: $background;
+    }
+    .gp-header {
+        height: 1;
+        background: $primary-darken-3;
+        color: $text-muted;
+        padding: 0 1;
+    }
+    .gp-tree  { height: 1fr; }
+    .gp-footer {
+        height: 1;
+        background: $surface;
+        color: $text-muted;
+        padding: 0 1;
+    }
+    """
+
+    class NodeOpened(Message):
+        def __init__(self, path: str) -> None:
+            self.path = path
+            super().__init__()
+
+    def __init__(self, vault: MemoryVault | None, **kwargs) -> None:
+        super().__init__(**kwargs)
+        self._vault = vault
+
+    def compose(self) -> ComposeResult:
+        yield Label(" MEMORY GRAPH", classes="gp-header")
+        yield Tree("Notes", id="gp-tree", classes="gp-tree")
+        yield Label(" ↑↓ navigate · Enter open in editor · m back",
+                    classes="gp-footer")
+
+    def on_mount(self) -> None:
+        self._populate()
+
+    def _populate(self) -> None:
+        tree = self.query_one("#gp-tree", Tree)
+        tree.clear()
+        if not self._vault:
+            tree.root.add_leaf("(no vault)")
+            tree.root.expand()
+            return
+        notes = self._vault.all_notes()
+        if not notes:
+            tree.root.add_leaf("(vault is empty)")
+            tree.root.expand()
+            return
+        by_dir: dict[str, list] = {}
+        for note in notes:
+            rel = self._vault.rel_path(note)
+            folder = Path(rel).parts[0] if len(Path(rel).parts) > 1 else ""
+            by_dir.setdefault(folder, []).append(note)
+        for folder in sorted(by_dir):
+            node = tree.root.add(f"[bold]{folder}[/bold]") if folder else tree.root
+            for note in sorted(by_dir[folder], key=lambda n: n.title):
+                leaf = node.add_leaf(note.title)
+                leaf.data = note.path
+        tree.root.expand()
+
+    @on(Tree.NodeSelected)
+    def _selected(self, event: Tree.NodeSelected) -> None:
+        if event.node.data:
+            self.post_message(self.NodeOpened(event.node.data))
+
+
+# ---------------------------------------------------------------------------
+# ProjectTabBar
+# ---------------------------------------------------------------------------
+
+class ProjectTabBar(Static):
+    """Top row of project tabs."""
+
+    DEFAULT_CSS = """
+    ProjectTabBar {
+        height: 1;
+        background: $surface;
+        layout: horizontal;
+    }
+    .tab { height: 1; background: $surface; color: $text-muted; border: none; min-width: 14; padding: 0 2; }
+    .tab.active { background: $accent; color: $background; }
+    .tab-add    { height: 1; background: $surface; color: $text-muted; border: none; min-width: 4; }
+    """
+
+    class TabPressed(Message):
+        def __init__(self, idx: int) -> None:
+            self.idx = idx
+            super().__init__()
+
+    class AddPressed(Message):
+        pass
+
+    def __init__(self, projects: list[Project], active_idx: int, **kwargs) -> None:
+        super().__init__(**kwargs)
+        self._projects  = projects
+        self._active    = active_idx
+
+    def compose(self) -> ComposeResult:
+        yield from self._make_buttons()
+
+    def _make_buttons(self):
+        for i, p in enumerate(self._projects):
+            cls = "tab active" if i == self._active else "tab"
+            yield Button(f" {p.name} ", id=f"ptab-{i}", classes=cls)
+        yield Button(" + ", id="ptab-add", classes="tab-add")
+
+    def refresh_tabs(self, projects: list[Project], active_idx: int) -> None:
+        self._projects = projects
+        self._active   = active_idx
+        # Update existing buttons in-place to avoid DuplicateIds from async removal
+        existing_tabs = {b.id: b for b in self.query(Button)}
+        new_buttons = list(self._make_buttons())
+        new_ids = {b.id for b in new_buttons}
+
+        # Remove buttons that no longer exist
+        for bid, btn in existing_tabs.items():
+            if bid not in new_ids:
+                btn.remove()
+
+        # Update or mount new buttons
+        for btn in new_buttons:
+            if btn.id in existing_tabs:
+                old = existing_tabs[btn.id]
+                old.label = btn.label
+                # Sync active/inactive class
+                old.set_class("active" in btn.classes, "active")
+            else:
+                self.mount(btn)
+
+    @on(Button.Pressed)
+    def _pressed(self, event: Button.Pressed) -> None:
+        bid = event.button.id or ""
+        if bid == "ptab-add":
+            self.post_message(self.AddPressed())
+        elif bid.startswith("ptab-"):
+            self.post_message(self.TabPressed(int(bid[5:])))
+
+
+# ---------------------------------------------------------------------------
+# PromptBar — suggestion row + input (prompt mode)
+# ---------------------------------------------------------------------------
+
+class PromptBar(Static):
+    """
+    Bottom bar.  Typing is only active when the Input is focused (prompt mode).
+    Tab  cycles suggestions.
+    Escape / ,  blurs input → returns to command mode.
+    """
+
+    DEFAULT_CSS = """
+    PromptBar {
+        height: 5;
+        background: $surface;
+        border-top: solid $accent;
+    }
+    .pb-suggestions {
+        height: 1;
+        background: $primary-darken-3;
+        padding: 0 1;
+        color: $text-muted;
+    }
+    .pb-input {
+        height: 3;
+        background: $background;
+        border: tall $accent;
+        color: $text;
+        padding: 0 1;
+    }
+    .pb-input:focus { border: tall $accent; }
+    """
+
+    suggestions: reactive[list[str]] = reactive(list, always_update=True)
+
+    def __init__(self, **kwargs) -> None:
+        super().__init__(**kwargs)
+        self._sugg_idx = -1   # for Tab cycling
+
+    def compose(self) -> ComposeResult:
+        yield Static("", id="pb-sugg", classes="pb-suggestions")
+        yield Input(
+            placeholder="› n or Enter to focus · type prompt · Tab=cycle suggestions · Escape=back",
+            id="pb-input",
+            classes="pb-input",
+        )
+
+    def watch_suggestions(self, suggestions: list[str]) -> None:
+        row = self.query_one("#pb-sugg", Static)
+        parts = [
+            f"[bold cyan][{i}][/bold cyan] {s[:28]}{'…' if len(s) > 28 else ''}"
+            for i, s in enumerate(suggestions[:4], 1)
+        ]
+        row.update("  ".join(parts) if parts else " (no suggestions yet)")
+
+    def focus_input(self) -> None:
+        inp = self.query_one("#pb-input", Input)
+        inp.focus()
+        self._sugg_idx = -1
+
+    def fill_suggestion(self, idx: int) -> None:
+        """Fill suggestion[idx] into the input and focus it."""
+        if idx < len(self.suggestions):
+            inp = self.query_one("#pb-input", Input)
+            inp.value = self.suggestions[idx]
+            inp.focus()
+            inp.action_end()
+            self._sugg_idx = idx
+
+    def on_input_key(self, event: Key) -> None:
+        """Intercept Tab and Escape inside the Input widget."""
+        if event.key == "tab":
+            self._cycle_suggestion()
+            event.prevent_default()
+            event.stop()
+        elif event.key == "escape":
+            # Return to command mode — handled by App.on_key bubbling
+            pass   # let it bubble to App
+
+    def _cycle_suggestion(self) -> None:
+        if not self.suggestions:
+            return
+        self._sugg_idx = (self._sugg_idx + 1) % len(self.suggestions)
+        inp = self.query_one("#pb-input", Input)
+        inp.value = self.suggestions[self._sugg_idx]
+        inp.action_end()
+
+    @on(Input.Submitted, "#pb-input")
+    def _submitted(self, event: Input.Submitted) -> None:
+        prompt = event.value.strip()
+        if prompt:
+            self.post_message(PromptSubmitted(prompt))
+            event.input.value = ""
+            self._sugg_idx = -1
+
+
+# ---------------------------------------------------------------------------
+# DirectoryPickerScreen — modal for picking a project directory
+# ---------------------------------------------------------------------------
+
+class DirectoryPickerScreen(ModalScreen):
+    """Modal overlay: navigate the filesystem and open a directory as a project."""
+
+    DEFAULT_CSS = """
+    DirectoryPickerScreen {
+        align: center middle;
+    }
+    #dp-container {
+        width: 72;
+        height: 32;
+        border: thick $accent;
+        background: $surface;
+        padding: 1 2;
+    }
+    #dp-header { height: 1; color: $text-muted; }
+    #dp-tree   { height: 1fr; border: solid $primary-darken-2; margin: 1 0; }
+    #dp-input  { height: 3; border: tall $accent; }
+    #dp-footer { height: 1; color: $text-muted; }
+    """
+
+    BINDINGS = [
+        Binding("escape",    "cancel", "Cancel", show=False),
+        Binding("backspace", "cancel", "Cancel", show=False),
+    ]
+
+    def __init__(self, start_path: str | None = None, **kwargs) -> None:
+        super().__init__(**kwargs)
+        import os
+        self._start = start_path or os.path.expanduser("~")
+
+    def compose(self) -> ComposeResult:
+        with Container(id="dp-container"):
+            yield Label(
+                " OPEN PROJECT  [dim]Navigate · Enter on dir = open · Escape = cancel[/dim]",
+                id="dp-header",
+            )
+            yield DirectoryTree(self._start, id="dp-tree")
+            yield Input(
+                value=self._start,
+                placeholder="or type/paste a path…",
+                id="dp-input",
+            )
+            yield Label(
+                " ↑↓ navigate tree · Enter on dir opens · Enter in path field opens",
+                id="dp-footer",
+            )
+
+    def on_mount(self) -> None:
+        self.query_one("#dp-tree", DirectoryTree).focus()
+
+    # Track highlighted node → update the path input
+    @on(Tree.NodeHighlighted, "#dp-tree")
+    def _node_highlighted(self, event: Tree.NodeHighlighted) -> None:
+        node = event.node
+        if node.data is not None:
+            path = str(node.data)
+            self.query_one("#dp-input", Input).value = path
+
+    # File clicked → use its parent directory
+    @on(DirectoryTree.FileSelected, "#dp-tree")
+    def _file_selected(self, event: DirectoryTree.FileSelected) -> None:
+        self.dismiss(str(Path(str(event.path)).parent))
+
+    # Directory selected (Textual ≥0.52) → open it
+    def on_directory_tree_directory_selected(self, event) -> None:
+        try:
+            self.dismiss(str(event.path))
+        except AttributeError:
+            pass
+
+    # Enter in path input
+    @on(Input.Submitted, "#dp-input")
+    def _input_submitted(self, event: Input.Submitted) -> None:
+        path = os.path.expanduser(event.value.strip())
+        if os.path.isdir(path):
+            self.dismiss(path)
+        else:
+            self.notify(f"Not a directory: {path}", severity="error", timeout=3)
+
+    def action_cancel(self) -> None:
+        self.dismiss(None)
+
+
+# ---------------------------------------------------------------------------
+# StatusBar — permission mode indicator + current project
+# ---------------------------------------------------------------------------
+
+_PERM_LABELS = {
+    "safe":         ("SAFE",          "$success"),
+    "accept_edits": ("ACCEPT EDITS",  "$warning"),
+    "bypass":       ("BYPASS ALL ⚡", "$error"),
+}
+_PERM_CYCLE = ["safe", "accept_edits", "bypass"]
+
+_AGENT_LABELS: dict[str, tuple[str, str]] = {
+    "claude": ("Claude", "$accent"),
+    "codex":  ("Codex",  "$warning"),
+    "cursor": ("Cursor", "$success"),
+}
+_AGENT_CYCLE = ["claude", "codex", "cursor"]
+
+
+class StatusBar(Static):
+    """Thin bar showing agent type, permission mode, and active project."""
+
+    DEFAULT_CSS = """
+    StatusBar {
+        height: 1;
+        background: $surface;
+        layout: horizontal;
+        border-bottom: solid $primary-darken-2;
+    }
+    .sb-project { color: $text-muted; padding: 0 2; width: 1fr; }
+    .sb-agent   { padding: 0 2; }
+    .sb-perm    { padding: 0 2; text-align: right; }
+    .sb-hint    { color: $text-muted; padding: 0 1; }
+    """
+
+    def compose(self) -> ComposeResult:
+        yield Label("", id="sb-project", classes="sb-project")
+        yield Label("", id="sb-hint",    classes="sb-hint")
+        yield Label("", id="sb-agent",   classes="sb-agent")
+        yield Label("", id="sb-perm",    classes="sb-perm")
+
+    def update_project(self, name: str) -> None:
+        self.query_one("#sb-project", Label).update(f" ⬡ {name}")
+
+    def update_agent(self, agent_type: str) -> None:
+        label, color = _AGENT_LABELS.get(agent_type, ("?", "$text"))
+        self.query_one("#sb-agent", Label).update(f"[{color}]{label}[/{color}]  A=cycle")
+
+    def update_perm(self, mode: str) -> None:
+        label, color = _PERM_LABELS.get(mode, ("?", "$text"))
+        self.query_one("#sb-perm",  Label).update(
+            f"[{color}]{label}[/{color}]  P=cycle"
+        )
+        self.query_one("#sb-hint",  Label).update(
+            "1-4=suggestion  o=open  n=agent"
+        )
+
+
+# ---------------------------------------------------------------------------
+# Main App
+# ---------------------------------------------------------------------------
+
+class VibeSwipeApp(App[None]):
+
+    CSS = """
+    Screen { layout: vertical; }
+    #main-row  { layout: horizontal; height: 1fr; }
+    #right-col { layout: vertical; width: 1fr; height: 1fr; }
+    AgentPanel    { height: 1fr; }
+    TerminalPanel { height: 20; }
+    """
+
+    # Single-key bindings — only active in command mode (Input/TextArea capture when focused)
+    BINDINGS: ClassVar[list[Binding]] = [
+        Binding("]",     "next_project",     "Next »"),
+        Binding("[",     "prev_project",     "« Prev"),
+        Binding("n",     "focus_prompt",     "New Agent"),
+        Binding("enter", "focus_prompt",     "New Agent",  show=False),
+        Binding("o",     "open_project",     "Open Project"),
+        Binding("x",     "cancel_agent",     "Cancel"),
+        Binding("d",     "close_agent",      "Dismiss"),
+        Binding("j",     "scroll_down",      "↓"),
+        Binding("k",     "scroll_up",        "↑"),
+        Binding("f",     "toggle_files",     "Files"),
+        Binding("e",     "toggle_editor",    "Editor"),
+        Binding("i",     "enter_edit",       "Edit File"),
+        Binding("m",     "toggle_graph",     "Memory"),
+        Binding("t",     "toggle_terminal",  "Terminal"),
+        Binding("ctrl+t","toggle_terminal",  "Terminal", show=False),
+        Binding("r",     "run_last_command", "Run Cmd"),
+        Binding("s",     "save_file",        "Save"),
+        Binding("escape","exit_mode",        "Back", show=False),
+        Binding("q",     "quit",             "Quit"),
+    ]
+
+    def __init__(self, config: dict) -> None:
+        super().__init__()
+        self._config = config
+
+        self._pm = ProjectManager()
+
+        vault_root   = config.get("vault", {}).get("root", "vault")
+        self._vault  = MemoryVault(vault_root)
+
+        pers_path    = os.path.join(vault_root, "user", "personalization_graph.json")
+        self._pers   = PersonalizationGraph(pers_path)
+        self._sugg   = PromptSuggestionEngine(self._pers)
+
+        self._auto_commit    = config.get("git", {}).get("auto_commit", True)
+        self._commit_prefix  = config.get("git", {}).get("commit_message_prefix", "[VibeSwipe] ")
+
+        # Agent type: "claude" | "codex" | "cursor"
+        self._agent_type: str = config.get("agent", {}).get("type", "claude")
+
+        # Permission mode: "safe" | "accept_edits" | "bypass"
+        self._perm_mode: str = config.get("claude", {}).get("permission_mode", "accept_edits")
+
+        # SDK client, profile analyzer, and memory infrastructure
+        self._sdk              = ClaudeSDKClient(config)
+        self._profile_analyzer = ProfileAnalyzer(self._sdk)
+        self._user_profile     = UserProfile(self._vault)
+        self._moc              = MOCManager(self._vault)
+        self._run_logger       = RunLogger(self._vault, self._moc)
+
+        # PreToolUse HTTP hook server (used in "safe" permission mode)
+        self._approval_server  = ApprovalServer(self._on_tool_approval_request)
+
+        # Open-project mode: next prompt submission opens a project instead of running agent
+        self._open_project_mode = False
+
+        self._show_files    = False
+        self._show_editor   = False
+        self._show_graph    = False
+        self._show_terminal = False
+        self._last_command: str = ""
+
+    # ------------------------------------------------------------------ compose
+
+    def compose(self) -> ComposeResult:
+        yield ProjectTabBar(self._pm.projects, self._pm.active_idx, id="tab-bar")
+        yield StatusBar(id="status-bar")
+        with Horizontal(id="main-row"):
+            yield FileBrowserPanel(id="file-browser")
+            yield EditorPanel(id="editor-panel")
+            with Vertical(id="right-col"):
+                yield AgentPanel(id="agent-panel")
+                yield TerminalPanel(id="terminal-panel")
+            yield GraphPane(self._vault, id="graph-pane")
+        yield PromptBar(id="prompt-bar")
+        yield Footer()
+
+    async def on_mount(self) -> None:
+        # Start the PreToolUse HTTP hook server (used in safe permission mode)
+        await self._approval_server.start()
+
+        # Start in command mode — agent panel holds focus
+        self.query_one("#file-browser").display   = False
+        self.query_one("#editor-panel").display   = False
+        self.query_one("#graph-pane").display     = False
+        self.query_one("#terminal-panel").display = False
+
+        active = self._pm.active
+        if active:
+            self.query_one("#agent-panel",    AgentPanel).switch_project(active.name)
+            self.query_one("#terminal-panel", TerminalPanel).switch_project(active.name, active.path)
+            self._load_active_file(active)
+            self.query_one("#file-browser",   FileBrowserPanel).set_root(active.path)
+            self.query_one("#status-bar",     StatusBar).update_project(active.name)
+
+        self.query_one("#status-bar", StatusBar).update_agent(self._agent_type)
+        self.query_one("#status-bar", StatusBar).update_perm(self._perm_mode)
+        self._refresh_suggestions()
+
+        # Focus the agent panel → command mode
+        self.query_one("#agent-panel", AgentPanel).focus()
+
+        if not self._pm.projects:
+            self.notify(
+                "No projects yet.  Press [bold]o[/bold] to open a project directory.",
+                title="VibeSwipe", timeout=7,
+            )
+        else:
+            self.notify(
+                f"{self._pm.active.name} — [bold]n[/bold]=new agent  "
+                "[bold]o[/bold]=open project  [bold]P[/bold]=permissions",
+                timeout=4,
+            )
+
+    # ------------------------------------------------------------------ key handling
+
+    def on_key(self, event: Key) -> None:
+        """Central key handler for command-mode shortcuts and mode exits."""
+        key      = event.key
+        char     = event.character or ""
+        focused  = self.focused
+        in_input = isinstance(focused, Input)
+        in_edit  = isinstance(focused, TextArea) and not getattr(focused, "read_only", True)
+        in_pty   = isinstance(focused, PTYWidget)
+
+        # ── PTY focused: PTYWidget.on_key routes keys to the shell and stops
+        #    them so no command shortcuts fire.  ctrl+t is NOT stopped by
+        #    PTYWidget, so it bubbles up and hits the Binding("ctrl+t",
+        #    "toggle_terminal") binding in BINDINGS — no extra handling needed.
+        if in_pty:
+            return
+
+        # ── Escape: exit any mode ──────────────────────────────────────────
+        if key == "escape":
+            if in_input:
+                self._exit_to_command()
+                event.stop()
+                return
+            if in_edit:
+                self.query_one("#editor-panel", EditorPanel).exit_edit_mode()
+                self._exit_to_command()
+                event.stop()
+                return
+
+        # ── Backspace / comma: back to command mode (not while typing) ─────
+        if key == "backspace" and not in_input and not in_edit:
+            self._exit_to_command()
+            event.stop()
+            return
+        if key == "comma" and not in_input and not in_edit:
+            self._exit_to_command()
+            event.stop()
+            return
+
+        # All remaining shortcuts only apply in command mode
+        if in_input or in_edit:
+            return
+
+        # ── 1–4: fill suggestion into prompt ──────────────────────────────
+        if key in "1234":
+            pb = self.query_one("#prompt-bar", PromptBar)
+            pb.fill_suggestion(int(key) - 1)
+            event.stop()
+            return
+
+        # ── A (shift+a): cycle agent type ─────────────────────────────────
+        if char == "A":
+            self._cycle_agent_type()
+            event.stop()
+            return
+
+        # ── P (shift+p): cycle permission mode ────────────────────────────
+        if char == "P":
+            self._cycle_permissions()
+            event.stop()
+            return
+
+    # ------------------------------------------------------------------ actions
+
+    # ------------------------------------------------------------------ helpers
+
+    def _exit_to_command(self) -> None:
+        """Return keyboard focus to the agent panel (command mode)."""
+        self._open_project_mode = False
+        pb = self.query_one("#prompt-bar", PromptBar)
+        pb.query_one("#pb-input", Input).placeholder = (
+            "› n or Enter to focus · type prompt · Tab=cycle · 1-4=fill suggestion"
+        )
+        self.query_one("#agent-panel", AgentPanel).focus()
+
+    def _cycle_agent_type(self) -> None:
+        idx = _AGENT_CYCLE.index(self._agent_type) if self._agent_type in _AGENT_CYCLE else 0
+        self._agent_type = _AGENT_CYCLE[(idx + 1) % len(_AGENT_CYCLE)]
+        self.query_one("#status-bar", StatusBar).update_agent(self._agent_type)
+        label, _ = _AGENT_LABELS[self._agent_type]
+        # Check availability
+        available = {
+            "claude": ClaudeSession.is_available(),
+            "codex":  CodexSession.is_available(),
+            "cursor": CursorSession.is_available(),
+        }
+        if not available.get(self._agent_type, False):
+            self.notify(
+                f"Agent → {label}  [dim](not installed — will show install hint on run)[/dim]",
+                timeout=4,
+            )
+        else:
+            self.notify(f"Agent → {label}", timeout=3)
+
+    def _cycle_permissions(self) -> None:
+        idx = _PERM_CYCLE.index(self._perm_mode) if self._perm_mode in _PERM_CYCLE else 0
+        self._perm_mode = _PERM_CYCLE[(idx + 1) % len(_PERM_CYCLE)]
+        self.query_one("#status-bar", StatusBar).update_perm(self._perm_mode)
+        label, _ = _PERM_LABELS[self._perm_mode]
+        self.notify(f"Permission mode → {label}", timeout=3)
+
+    # ------------------------------------------------------------------ project actions
+
+    def action_next_project(self) -> None:
+        self._pm.next_project()
+        self._on_project_changed()
+
+    def action_prev_project(self) -> None:
+        self._pm.prev_project()
+        self._on_project_changed()
+
+    def action_open_project(self) -> None:
+        """Push the directory-picker modal; result is a path string or None."""
+        active = self._pm.active
+        start  = active.path if active else None
+
+        def _handle(path: str | None) -> None:
+            if not path:
+                return
+            path = os.path.expanduser(path)
+            if os.path.isdir(path):
+                self._pm.add_project(path)
+                self._pm.set_active(len(self._pm.projects) - 1)
+                self._on_project_changed()
+                self.notify(f"Opened: {self._pm.active.name}", timeout=3)
+            else:
+                self.notify(f"Not a valid directory: {path}", severity="error", timeout=5)
+
+        self.push_screen(DirectoryPickerScreen(start_path=start), _handle)
+
+    def action_focus_prompt(self) -> None:
+        self.query_one("#prompt-bar", PromptBar).focus_input()
+
+    def action_cancel_agent(self) -> None:
+        self.query_one("#agent-panel", AgentPanel).cancel_last()
+
+    def action_close_agent(self) -> None:
+        self.query_one("#agent-panel", AgentPanel).remove_last()
+
+    def action_scroll_down(self) -> None:
+        self.query_one("#agent-panel", AgentPanel).scroll_down()
+
+    def action_scroll_up(self) -> None:
+        self.query_one("#agent-panel", AgentPanel).scroll_up()
+
+    def action_toggle_files(self) -> None:
+        self._show_files = not self._show_files
+        self._apply_layout()
+        if self._show_files:
+            self.query_one("#file-browser", FileBrowserPanel).focus_tree()
+
+    def action_toggle_editor(self) -> None:
+        self._show_editor = not self._show_editor
+        self._apply_layout()
+
+    def action_enter_edit(self) -> None:
+        if not self._show_editor:
+            # Auto-show editor first
+            self._show_editor = True
+            self._apply_layout()
+        self.query_one("#editor-panel", EditorPanel).enter_edit_mode()
+
+    def action_toggle_graph(self) -> None:
+        self._show_graph = not self._show_graph
+        self._apply_layout()
+
+    def action_toggle_terminal(self) -> None:
+        self._show_terminal = not self._show_terminal
+        self._apply_layout()
+        if self._show_terminal:
+            self.query_one("#terminal-panel", TerminalPanel).focus_input()
+
+    def action_run_last_command(self) -> None:
+        if not self._last_command:
+            self.notify("No command detected yet.", timeout=2)
+            return
+        # Show terminal if hidden
+        if not self._show_terminal:
+            self._show_terminal = True
+            self._apply_layout()
+        tp = self.query_one("#terminal-panel", TerminalPanel)
+        tp.focus_input()
+        tp.run_command(self._last_command)
+
+    def action_save_file(self) -> None:
+        ep = self.query_one("#editor-panel", EditorPanel)
+        if ep.is_in_edit_mode:
+            ep.save()
+            self.notify("Saved.", timeout=2)
+        else:
+            self.notify("Not in edit mode (press i first).", timeout=2)
+
+    def action_exit_mode(self) -> None:
+        self._exit_to_command()
+
+    # ------------------------------------------------------------------ layout
+
+    def _apply_layout(self) -> None:
+        fb    = self.query_one("#file-browser",   FileBrowserPanel)
+        ep    = self.query_one("#editor-panel",   EditorPanel)
+        ap    = self.query_one("#agent-panel",    AgentPanel)
+        tp    = self.query_one("#terminal-panel", TerminalPanel)
+        graph = self.query_one("#graph-pane",     GraphPane)
+
+        if self._show_graph:
+            fb.display    = False
+            ep.display    = False
+            ap.display    = False
+            tp.display    = False
+            graph.display = True
+            graph.query_one("#gp-tree", Tree).focus()
+        else:
+            graph.display = False
+            fb.display    = self._show_files
+            ep.display    = self._show_editor
+            ap.display    = True
+            tp.display    = self._show_terminal
+            if not self._show_editor or not ep.is_in_edit_mode:
+                ap.focus()
+
+    # ------------------------------------------------------------------ project switching
+
+    def _on_project_changed(self) -> None:
+        active = self._pm.active
+        self.query_one("#tab-bar", ProjectTabBar).refresh_tabs(
+            self._pm.projects, self._pm.active_idx
+        )
+        if active:
+            # Switch per-project containers — does NOT cancel running agents
+            self.query_one("#agent-panel",    AgentPanel).switch_project(active.name)
+            self.query_one("#terminal-panel", TerminalPanel).switch_project(active.name, active.path)
+            self._load_active_file(active)
+            self.query_one("#file-browser",   FileBrowserPanel).set_root(active.path)
+            self.query_one("#status-bar",     StatusBar).update_project(active.name)
+        self._refresh_suggestions()
+        self.query_one("#agent-panel", AgentPanel).focus()
+
+    @on(FileBrowserPanel.FileSelected)
+    def _file_browser_selected(self, event: FileBrowserPanel.FileSelected) -> None:
+        self._show_editor = True
+        self._apply_layout()
+        self.query_one("#editor-panel", EditorPanel).load_file(event.path)
+        active = self._pm.active
+        if active:
+            try:
+                self._pm.set_active_file(os.path.relpath(event.path, active.path))
+            except ValueError:
+                pass
+
+    @on(ProjectTabBar.TabPressed)
+    def _tab_pressed(self, event: ProjectTabBar.TabPressed) -> None:
+        self._pm.set_active(event.idx)
+        self._on_project_changed()
+
+    @on(ProjectTabBar.AddPressed)
+    def _add_project(self, _: ProjectTabBar.AddPressed) -> None:
+        self.action_open_project()
+
+    # ------------------------------------------------------------------ prompt → agent
+
+    @on(PromptSubmitted)
+    def _on_prompt(self, event: PromptSubmitted) -> None:
+        prompt = event.prompt.strip()
+        if not prompt:
+            return
+
+        # ── Open-project mode ──────────────────────────────────────────────
+        if self._open_project_mode:
+            self._open_project_mode = False
+            self._exit_to_command()
+            path = os.path.expanduser(prompt)
+            if os.path.isdir(path):
+                proj = self._pm.add_project(path)
+                self._pm.set_active(len(self._pm.projects) - 1)
+                self._on_project_changed()
+                self.notify(f"Opened: {proj.name}", timeout=3)
+            else:
+                self.notify(
+                    f"Not a valid directory: {path}",
+                    severity="error", timeout=5,
+                )
+            return
+
+        active = self._pm.active
+
+        # No project open yet — also treat as path
+        if active is None:
+            self.action_open_project()
+            return
+
+        # ── Normal: launch Claude agent ───────────────────────────────────
+        self._sugg.record(active.name, prompt)
+        self._pers.save()
+
+        # In safe mode, write the PreToolUse HTTP hook so Claude pauses for approval
+        if self._perm_mode == "safe" and self._agent_type == "claude":
+            self._write_pretooluse_hook(active.path)
+
+        session = self._make_session(prompt, active.path)
+        self.query_one("#agent-panel", AgentPanel).add_agent(session, vault=self._vault)
+
+        if self._show_graph:
+            self._show_graph = False
+        self._apply_layout()
+        self._exit_to_command()
+        self._refresh_suggestions()
+
+    def _make_session(
+        self,
+        prompt: str,
+        project_path: str,
+        resume_session_id: str | None = None,
+    ) -> AgentSession:
+        """Create the correct AgentSession subclass for the active agent type."""
+        kwargs = dict(
+            prompt=prompt,
+            project_path=project_path,
+            permission_mode=self._perm_mode,
+            resume_session_id=resume_session_id,
+        )
+        if self._agent_type == "codex":
+            return CodexSession(**kwargs)
+        if self._agent_type == "cursor":
+            return CursorSession(**kwargs)
+        return ClaudeSession(**kwargs)
+
+    # ------------------------------------------------------------------ agent completion
+
+    @on(AgentPanel.AgentComplete)
+    def _agent_done(self, event: AgentPanel.AgentComplete) -> None:
+        w      = event.agent_widget
+        active = self._pm.active
+        if event.exit_code == 0:
+            self.notify(f"#{w.number} done: {w.session.prompt[:45]}", timeout=4)
+            if self._auto_commit and active and active.is_git_repo():
+                self._auto_git_commit(active.path, w.session.prompt)
+            if active:
+                self._post_run_hook(w, active)
+        else:
+            self.notify(f"#{w.number} failed (exit {event.exit_code})",
+                        severity="error", timeout=5)
+
+    @work(thread=True)
+    def _post_run_hook(self, w, active) -> None:
+        """Background hook that runs after every successful agent completion.
+
+        Steps:
+        1. Record prompt in suggestion engine
+        2. Log the run to vault (creates a timestamped note)
+        3. Update MOCs + index MOC
+        4. Run vault linter and write any issues to vault
+        5. Update user psychometric profile via LLM
+        6. Generate personalized next-prompt predictions, blended with graph
+        7. Push updated suggestions to the prompt bar
+        """
+        prompt      = w.session.prompt
+        output_tail: list[str] = list(w.session.output_tail)
+        project     = active.name
+
+        # 1. Record in suggestion engine
+        self._sugg.record(project, prompt)
+
+        # 2. Log run to vault (also updates MOCs internally)
+        try:
+            action_id = prompt[:40].replace(" ", "_").replace("/", "-").lower()
+            self._run_logger.log(
+                action_id=action_id,
+                action_label=prompt[:60],
+                project=project,
+                prompt=prompt,
+                output="\n".join(output_tail),
+            )
+        except Exception:
+            pass
+
+        # 3. Update MOCs (index, since run_logger already updates project MOC)
+        try:
+            self._moc.update_index_moc()
+        except Exception:
+            pass
+
+        # 4. Vault linter
+        try:
+            linker = Linker(self._vault)
+            linter = VaultLinter(self._vault, linker)
+            report = linter.run()
+            if report.has_issues:
+                lines = []
+                for src, tgt in report.broken_links:
+                    lines.append(f"- Broken link: [[{src}]] → [[{tgt}]]")
+                for t in report.orphan_notes:
+                    lines.append(f"- Orphan: {t}")
+                for t in report.stale_mocs:
+                    lines.append(f"- Stale MOC: {t}")
+                for t in report.empty_notes:
+                    lines.append(f"- Empty note: {t}")
+                body = "\n".join(lines)
+                lint_rel = os.path.join("meta", "lint_report")
+                existing = self._vault.get_note(lint_rel)
+                if existing is None:
+                    self._vault.create_note(
+                        lint_rel,
+                        title="Vault Lint Report",
+                        body=body,
+                        tags=["meta", "lint"],
+                        note_type="meta",
+                    )
+                else:
+                    from memory.note import FRONTMATTER_RE as _FM_RE
+                    fm_m = _FM_RE.match(existing.content)
+                    existing.content = (
+                        existing.content[:fm_m.end()] if fm_m else ""
+                    ) + body
+                    self._vault.save_note(existing)
+        except Exception:
+            pass
+
+        # 5. Update user profile via LLM (skip if SDK unavailable)
+        new_profile = ""
+        if self._profile_analyzer.is_available():
+            try:
+                recent_prompts = self._sugg.get_recent_prompts(project, n=10)
+                current_profile = self._user_profile.read()
+                new_profile = self._profile_analyzer.update_profile(
+                    prompt=prompt,
+                    output_tail=output_tail,
+                    project=project,
+                    recent_prompts=recent_prompts,
+                    current_profile=current_profile,
+                )
+                if new_profile:
+                    self._user_profile.write(new_profile)
+            except Exception:
+                pass
+
+        # 6. Personalized next-prompt predictions
+        suggestions: list[str] = []
+        if self._profile_analyzer.is_available():
+            try:
+                profile_text   = new_profile or self._user_profile.read()
+                recent_prompts = self._sugg.get_recent_prompts(project, n=8)
+                suggestions    = self._profile_analyzer.predict_prompts(
+                    profile=profile_text,
+                    project=project,
+                    last_prompt=prompt,
+                    output_tail=output_tail,
+                    recent_prompts=recent_prompts,
+                    n=4,
+                )
+            except Exception:
+                pass
+
+        # Blend with graph-based fallbacks
+        graph_suggestions = self._sugg.get_suggestions(
+            project_name=project,
+            last_prompt=prompt,
+            n=4,
+        )
+        blended = suggestions + [s for s in graph_suggestions if s not in suggestions]
+        blended = blended[:4]
+
+        # 7. Push to prompt bar
+        if blended:
+            self.call_from_thread(
+                self.query_one("#prompt-bar", PromptBar).__setattr__,
+                "suggestions",
+                blended,
+            )
+
+    # ------------------------------------------------------------------ permission decisions
+
+    @on(PermissionPrompt.Decision)
+    async def _permission_decision(self, event: PermissionPrompt.Decision) -> None:
+        """Handle approve/deny from the inline permission prompt."""
+        rid  = event.request_id   # HTTP server request ID to unblock
+        tool = event.tool_name
+        proj_path = (self._pm.active.path if self._pm.active
+                     else event.session.project_path)
+
+        if event.allow:
+            if event.always:
+                # Persist the allow rule so future runs don't prompt
+                self._write_permission_allow(proj_path, tool)
+                self.notify(
+                    f"[bold]{tool}[/bold] added to settings.local.json permanently.",
+                    timeout=5,
+                )
+            else:
+                self.notify(f"[bold]{tool}[/bold] approved.", timeout=2)
+            # Unblock the waiting HTTP hook — Claude continues immediately
+            self._approval_server.respond(rid, allow=True)
+        else:
+            self.notify(f"Denied: [bold]{tool}[/bold]", severity="warning", timeout=3)
+            self._approval_server.respond(rid, allow=False,
+                                          reason=f"User denied {tool}")
+
+    # ------------------------------------------------------------------ approval server
+
+    def _on_tool_approval_request(self, request_id: str, payload: dict) -> None:
+        """
+        Called by ApprovalServer when Claude's PreToolUse hook fires.
+        Surfaces a PermissionPrompt widget on the currently running agent.
+        """
+        tool_name  = payload.get("tool_name", "unknown")
+        tool_input = payload.get("tool_input", {})
+
+        # Find the most-recently-mounted agent that is still running
+        agent = self._find_running_agent()
+        if agent is None:
+            self._approval_server.respond(request_id, allow=False,
+                                          reason="No running agent found")
+            return
+
+        request = {
+            "type":       "permission_request",
+            "tool_name":  tool_name,
+            "tool_input": tool_input,
+            "request_id": request_id,
+        }
+        prompt_widget = PermissionPrompt(agent, agent.session, request)
+        if agent._status:
+            agent.mount(prompt_widget, before=agent._status)
+        else:
+            agent.mount(prompt_widget)
+
+    def _find_running_agent(self) -> "AgentWidget | None":
+        """Return the most recently mounted AgentWidget (active project) that has not finished."""
+        try:
+            ap     = self.query_one("#agent-panel", AgentPanel)
+            agents = ap.active_agents()
+            for w in reversed(agents):
+                # _mark_complete shows the reply input — if it's hidden the agent is running
+                sid   = w.session.session_id
+                reply = w.query_one(f"#agent-reply-{sid}", Input)
+                if not reply.display:
+                    return w
+            return agents[-1] if agents else None
+        except Exception:
+            return None
+
+    def _write_permission_allow(self, project_path: str, tool_name: str) -> None:
+        """Append tool_name to .claude/settings.local.json permissions.allow."""
+        import json as _json
+        claude_dir    = os.path.join(project_path, ".claude")
+        os.makedirs(claude_dir, exist_ok=True)
+        settings_path = os.path.join(claude_dir, "settings.local.json")
+        try:
+            with open(settings_path) as f:
+                settings = _json.load(f)
+        except (FileNotFoundError, _json.JSONDecodeError):
+            settings = {}
+        perms = settings.setdefault("permissions", {})
+        allow = perms.setdefault("allow", [])
+        if tool_name not in allow:
+            allow.append(tool_name)
+        settings.setdefault("autoCompact", True)
+        with open(settings_path, "w") as f:
+            _json.dump(settings, f, indent=2)
+
+    def _write_pretooluse_hook(self, project_path: str) -> None:
+        """Write the PreToolUse HTTP hook into .claude/settings.local.json."""
+        import json as _json
+        claude_dir    = os.path.join(project_path, ".claude")
+        os.makedirs(claude_dir, exist_ok=True)
+        settings_path = os.path.join(claude_dir, "settings.local.json")
+        try:
+            with open(settings_path) as f:
+                settings = _json.load(f)
+        except (FileNotFoundError, _json.JSONDecodeError):
+            settings = {}
+        port = self._approval_server.port
+        settings.setdefault("hooks", {})["PreToolUse"] = [
+            {
+                "hooks": [
+                    {
+                        "type":    "http",
+                        "url":     f"http://127.0.0.1:{port}/pre-tool",
+                        "timeout": 300,
+                    }
+                ]
+            }
+        ]
+        settings.setdefault("autoCompact", True)
+        with open(settings_path, "w") as f:
+            _json.dump(settings, f, indent=2)
+
+    @work(thread=True)
+    def _auto_git_commit(self, project_path: str, prompt: str) -> None:
+        import subprocess
+        msg = self._commit_prefix + prompt[:72]
+        try:
+            subprocess.run(["git", "-C", project_path, "add", "-A"],
+                           capture_output=True, timeout=10)
+            r = subprocess.run(["git", "-C", project_path, "commit", "-m", msg],
+                               capture_output=True, text=True, timeout=15)
+            if r.returncode == 0:
+                self.call_from_thread(self.notify, f"Committed: {msg[:50]}", timeout=3)
+        except Exception:
+            pass
+
+    # ------------------------------------------------------------------ command detection
+
+    @on(CommandDetected)
+    def _command_detected(self, event: CommandDetected) -> None:
+        """Track the last detected shell command from agent output."""
+        self._last_command = event.cmd
+
+    # ------------------------------------------------------------------ graph
+
+    @on(GraphPane.NodeOpened)
+    def _graph_node(self, event: GraphPane.NodeOpened) -> None:
+        # Show in editor
+        self._show_graph  = False
+        self._show_editor = True
+        self._apply_layout()
+        self.query_one("#editor-panel", EditorPanel).load_file(event.path)
+
+    # ------------------------------------------------------------------ editor / file
+
+    def _load_active_file(self, project: Project) -> None:
+        path = project.resolve_active_file()
+        if path:
+            self.query_one("#editor-panel", EditorPanel).load_file(path)
+
+    # ------------------------------------------------------------------ suggestions
+
+    def _refresh_suggestions(self) -> None:
+        active = self._pm.active
+        if not active:
+            return
+        ep = self.query_one("#editor-panel", EditorPanel)
+        suggestions = self._sugg.get_suggestions(
+            project_name=active.name,
+            active_file=ep.current_path,
+            n=4,
+        )
+        self.query_one("#prompt-bar", PromptBar).suggestions = suggestions
+
+
+# ---------------------------------------------------------------------------
+# helpers
+# ---------------------------------------------------------------------------
+
+def _language_for(path: str) -> str | None:
+    ext = Path(path).suffix.lower()
+    return {
+        ".py": "python", ".js": "javascript", ".ts": "typescript",
+        ".tsx": "typescript", ".jsx": "javascript", ".go": "go",
+        ".rs": "rust", ".md": "markdown", ".json": "json",
+        ".toml": "toml", ".yaml": "yaml", ".yml": "yaml",
+        ".html": "html", ".css": "css", ".sh": "bash",
+        ".bash": "bash", ".c": "c", ".cpp": "cpp",
+    }.get(ext)
