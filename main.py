@@ -1,23 +1,29 @@
 #!/usr/bin/env python3
 """
-VibeSwipe — keyboard-first multi-project Claude Code TUI.
+vibe-cli — keyboard-first multi-project AI coding terminal.
 
 Usage:
+    vibe [--config PATH] [--add PATH ...]
     python main.py [--config PATH] [--add PATH ...]
 
-Keys:
-    Alt+] / Alt+[              — next / prev project
-    Alt+1 … Alt+9             — jump to project by number
-    Ctrl+N                     — new Claude agent (opens prompt bar)
-    Ctrl+W                     — close last agent
-    Ctrl+E                     — focus editor
-    Ctrl+B                     — focus sidebar file tree
-    Ctrl+G                     — toggle knowledge graph view
-    Ctrl+S                     — save current file
-    Ctrl+P                     — focus prompt bar
-    1-4                        — fill suggestion into prompt
-    Enter                      — execute prompt / submit
-    Ctrl+Q                     — quit
+Keys (command mode):
+    ] / [       next / prev project
+    1–9         jump to project by number
+    n / Enter   new agent prompt
+    x           cancel last agent
+    d           dismiss last agent
+    j / k       scroll agents down / up
+    f           toggle file browser
+    e           toggle editor
+    i           enter edit mode
+    m           toggle memory graph
+    t           toggle terminal
+    r           run last detected shell command
+    s           save file
+    A           cycle agent type (Claude / Codex / Cursor)
+    P           cycle permission mode (Safe / Accept Edits / Bypass)
+    o           open project (directory picker)
+    q           quit
 """
 from __future__ import annotations
 
@@ -35,7 +41,7 @@ def load_config(path: str) -> dict:
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="VibeSwipe — multi-project Claude TUI")
+    parser = argparse.ArgumentParser(description="vibe-cli — multi-project AI coding terminal")
     parser.add_argument("--config", default="config.json")
     parser.add_argument("--add", nargs="*", metavar="PATH",
                         help="Project directories to open on startup")

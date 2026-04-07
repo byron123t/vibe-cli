@@ -7,6 +7,15 @@ Keyboard-first multi-project AI coding terminal. Run Claude Code, Codex, or Curs
 ## Install
 
 ```bash
+make install
+vibe --add ~/code/myproject ~/code/another-project
+```
+
+`make install` uses whichever `python3` is active in your shell — so activate your virtualenv or conda env first if you use one. It's equivalent to `python3 -m pip install -e .`
+
+Or without installing:
+
+```bash
 pip install -r requirements.txt
 python main.py --add ~/code/myproject ~/code/another-project
 ```
@@ -160,6 +169,6 @@ python main.py --add ~/code/myapp ~/code/api
 ## Tests
 
 ```bash
-pip install pytest pytest-asyncio
-python -m pytest tests/ -v
+make dev   # installs pytest + pytest-asyncio
+make test
 ```

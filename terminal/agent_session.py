@@ -84,3 +84,30 @@ class AgentSession(ABC):
     @property
     def is_done(self) -> bool:
         return self.exit_code is not None
+
+
+class RestoredSession(AgentSession):
+    """
+    A pre-completed session rebuilt from saved state.  Never spawns a process.
+    Used by AgentWidget to show saved output and allow --resume replies.
+    """
+
+    @staticmethod
+    def is_available() -> bool:
+        return True
+
+    async def run(self, on_line=None, on_permission_request=None) -> int:
+        return self.exit_code or 0
+
+    @classmethod
+    def from_saved(cls, data: dict) -> "RestoredSession":
+        inst = cls(
+            prompt=data["prompt"],
+            project_path=data["project_path"],
+            session_id=data.get("session_id"),
+            permission_mode=data.get("permission_mode", "accept_edits"),
+        )
+        inst.captured_session_id = data.get("captured_session_id")
+        code = data.get("exit_code")
+        inst.exit_code = code if code is not None else -1  # -1 = was interrupted
+        return inst

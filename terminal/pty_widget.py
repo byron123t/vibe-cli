@@ -18,7 +18,7 @@ import threading
 from typing import Optional
 
 from textual.widgets import Static
-from textual.events import Key, Resize
+from textual.events import Key, Resize, MouseScrollUp, MouseScrollDown
 from rich.text import Text
 from rich.style import Style
 
@@ -93,8 +93,7 @@ _KEY_TO_SEQ: dict[str, bytes] = {
     "ctrl+up":        b"\x1b[1;5A",
     "ctrl+down":      b"\x1b[1;5B",
     "shift+tab":      b"\x1b[Z",
-    "shift+up":       b"\x1b[1;2A",
-    "shift+down":     b"\x1b[1;2B",
+    # shift+up / shift+down are intercepted for scrollback in on_key
     "shift+left":     b"\x1b[1;2D",
     "shift+right":    b"\x1b[1;2C",
 }
@@ -174,7 +173,7 @@ class PTYWidget(Static, can_focus=True):
         self._command   = command
         self._cols      = 80
         self._rows      = 24
-        self._screen: Optional["pyte.Screen"]         = None
+        self._screen: Optional["pyte.HistoryScreen"]  = None
         self._stream: Optional["pyte.ByteStream"]     = None
         self._proc:   Optional["_ptyproc.PtyProcess"] = None
         self._lock      = threading.Lock()
@@ -242,7 +241,8 @@ class PTYWidget(Static, can_focus=True):
             "COLUMNS":   str(self._cols),
             "LINES":     str(self._rows),
         }
-        self._screen = pyte.Screen(self._cols, self._rows)
+        self._screen = pyte.HistoryScreen(self._cols, self._rows,
+                                           history=5000, ratio=0.5)
         self._stream = pyte.ByteStream(self._screen)
         try:
             self._proc = _ptyproc.PtyProcess.spawn(
@@ -317,16 +317,71 @@ class PTYWidget(Static, can_focus=True):
 
     # ------------------------------------------------------------------ key handling
 
+    def _is_scrolled(self) -> bool:
+        """True when the viewport is showing history rather than live output."""
+        try:
+            return bool(self._screen and self._screen.history.bottom)
+        except Exception:
+            return False
+
+    def _scroll_up(self) -> None:
+        if self._screen:
+            with self._lock:
+                self._screen.prev_page()
+            self._dirty = True
+
+    def _scroll_down(self) -> None:
+        if self._screen:
+            with self._lock:
+                self._screen.next_page()
+            self._dirty = True
+
+    def _jump_to_live(self) -> None:
+        """Scroll all the way back to live output."""
+        if not self._screen:
+            return
+        with self._lock:
+            while self._screen.history.bottom:
+                self._screen.next_page()
+        self._dirty = True
+
+    # ------------------------------------------------------------------ scroll events
+
+    def on_mouse_scroll_up(self, event: MouseScrollUp) -> None:
+        """Two-finger trackpad / mouse wheel scroll up → scrollback."""
+        self._scroll_up()
+        event.stop()
+
+    def on_mouse_scroll_down(self, event: MouseScrollDown) -> None:
+        """Two-finger trackpad / mouse wheel scroll down → forward through history."""
+        self._scroll_down()
+        event.stop()
+
     def on_key(self, event: Key) -> None:
-        """Forward keys to the PTY. ctrl+t is reserved for terminal toggle."""
+        """Forward keys to the PTY. Scrollback via trackpad or ctrl+shift+↑/↓."""
         key = event.key
 
         # Let ctrl+t bubble up so the App can close the terminal
         if key == "ctrl+t":
             return
 
+        # ── Scrollback keyboard shortcuts (work on every keyboard) ────────
+        # ctrl+shift+up / ctrl+shift+down — not forwarded to PTY
+        if key in ("ctrl+shift+up", "shift+up"):
+            self._scroll_up()
+            event.stop()
+            return
+        if key in ("ctrl+shift+down", "shift+down"):
+            self._scroll_down()
+            event.stop()
+            return
+
         if not self._proc or not self._proc.isalive():
             return
+
+        # Any key sent to the PTY snaps back to live output first
+        if self._is_scrolled():
+            self._jump_to_live()
 
         seq = _KEY_TO_SEQ.get(key)
         if seq is not None:
@@ -346,13 +401,26 @@ class PTYWidget(Static, can_focus=True):
         if self._screen is None:
             return Text("")
 
+        scrolled    = self._is_scrolled()
         cursor_y    = self._screen.cursor.y
         cursor_x    = self._screen.cursor.x
-        show_cursor = self.has_focus and self.is_alive()
+        # Don't render cursor when showing history — it would be misleading
+        show_cursor = self.has_focus and self.is_alive() and not scrolled
 
         text = Text(no_wrap=True, overflow="crop")
+
+        if scrolled:
+            # One-line indicator pinned above the scrolled content
+            indicator = " SCROLLBACK  scroll or shift+↓ to return to live "
+            bar = indicator.center(self._cols)
+            text.append(bar, style=Style(color="black", bgcolor="yellow", bold=True))
+            text.append("\n")
+            render_rows = self._screen.lines - 1
+        else:
+            render_rows = self._screen.lines
+
         with self._lock:
-            for y in range(self._screen.lines):
+            for y in range(render_rows):
                 row = self._screen.buffer[y]
                 for x in range(self._screen.columns):
                     char = row[x]
@@ -375,7 +443,7 @@ class PTYWidget(Static, can_focus=True):
                         )
                     text.append(ch, style=style)
 
-                if y < self._screen.lines - 1:
+                if y < render_rows - 1:
                     text.append("\n")
 
         return text

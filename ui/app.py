@@ -57,6 +57,7 @@ from textual.widgets import (
 from textual import work, on
 
 from core.project_manager import Project, ProjectManager
+from core.session_store import SessionStore
 from terminal.agent_session import AgentSession
 from terminal.claude_session import ClaudeSession, PERMISSION_FLAGS
 from terminal.codex_session import CodexSession
@@ -361,11 +362,14 @@ class AgentWidget(Static):
             super().__init__()
 
     def __init__(self, session: AgentSession, number: int,
-                 vault: "MemoryVault | None" = None, **kwargs) -> None:
+                 vault: "MemoryVault | None" = None,
+                 restore: "dict | None" = None,
+                 **kwargs) -> None:
         super().__init__(**kwargs)
         self.session  = session          # original session — stable, never replaced
         self.number   = number
         self._vault   = vault
+        self._restore = restore          # saved state dict; if set, skip running
         self._log:    RichLog | None = None
         self._ta:     SelectableLog | None = None
         self._status: Label | None = None
@@ -397,7 +401,41 @@ class AgentWidget(Static):
         self._ta     = self.query_one(f"#agent-ta-{sid}",     SelectableLog)
         self._status = self.query_one(f"#agent-status-{sid}", Label)
         self._ta.display = False          # hidden until first completion
-        self._run_session()
+        if self._restore:
+            self._restore_state()
+        else:
+            self._run_session()
+
+    # ------------------------------------------------------------------ restore
+
+    def _restore_state(self) -> None:
+        """Populate from saved data without running the subprocess."""
+        output = (self._restore or {}).get("output", "")
+        if output:
+            self._full_lines = output.split("\n")
+            if self._log:
+                for line in self._full_lines:
+                    self._log.write(line)
+        exit_code = self.session.exit_code
+        if exit_code is None:
+            exit_code = -1
+        self._mark_complete(exit_code, restored=True)
+
+    def to_state(self) -> dict:
+        """Serialize current widget state for session persistence."""
+        from core.session_store import SessionStore
+        active = self._active_session
+        return {
+            "number":             self.number,
+            "prompt":             self.session.prompt,
+            "session_id":         self.session.session_id,
+            "captured_session_id": (active.captured_session_id
+                                    or self.session.captured_session_id),
+            "project_path":       self.session.project_path,
+            "permission_mode":    self.session.permission_mode,
+            "exit_code":          active.exit_code,
+            "output":             SessionStore.cap_output(self._full_lines),
+        }
 
     # ------------------------------------------------------------------ streaming
 
@@ -425,14 +463,19 @@ class AgentWidget(Static):
 
     # ------------------------------------------------------------------ completion
 
-    def _mark_complete(self, exit_code: int) -> None:
+    def _mark_complete(self, exit_code: int, restored: bool = False) -> None:
         sid = self.session.session_id
 
         if self._status:
             if exit_code == 0:
-                self._status.update(f"✓ Done  ({self._active_session.elapsed:.1f}s)")
+                suffix = "restored" if restored else f"{self._active_session.elapsed:.1f}s"
+                self._status.update(f"✓ Done  ({suffix})")
                 self._status.remove_class("agent-status-running")
                 self._status.add_class("agent-status-done")
+            elif exit_code == -1:
+                self._status.update("⚠ Interrupted  (session restored)")
+                self._status.remove_class("agent-status-running")
+                self._status.add_class("agent-status-error")
             else:
                 self._status.update(f"✗ Failed (exit {exit_code})")
                 self._status.remove_class("agent-status-running")
@@ -660,6 +703,41 @@ class AgentPanel(Static, can_focus=True):
             return list(self._active_container().query(AgentWidget))
         except Exception:
             return []
+
+    def get_agents_for_project(self, project_name: str) -> list["AgentWidget"]:
+        """Return AgentWidgets for any project (used during session save)."""
+        cid = self._container_id(project_name)
+        try:
+            return list(self.query_one(f"#{cid}", ScrollableContainer).query(AgentWidget))
+        except Exception:
+            return []
+
+    def restore_agents(
+        self,
+        project_name: str,
+        agents_data: list[dict],
+        vault: "MemoryVault | None",
+    ) -> None:
+        """Create AgentWidgets from saved session data for the given project."""
+        from terminal.agent_session import RestoredSession
+        # Ensure the project container exists (switch_project must have been called first)
+        try:
+            container = self._active_container()
+        except Exception:
+            return
+        max_num = 0
+        for data in agents_data:
+            session = RestoredSession.from_saved(data)
+            num     = data.get("number", max_num + 1)
+            max_num = max(max_num, num)
+            widget  = AgentWidget(
+                session, number=num, vault=vault,
+                restore=data,
+                id=f"agent-{session.session_id}",
+            )
+            container.mount(widget)
+        self._project_counts[project_name] = max_num
+        self._update_hint()
 
     def scroll_down(self) -> None:
         try:
@@ -967,17 +1045,47 @@ class GraphPane(Static):
 # ---------------------------------------------------------------------------
 
 class ProjectTabBar(Static):
-    """Top row of project tabs."""
+    """Top row of project tabs with numbered labels and active indicator."""
 
     DEFAULT_CSS = """
     ProjectTabBar {
         height: 1;
-        background: $surface;
+        background: $panel;
         layout: horizontal;
     }
-    .tab { height: 1; background: $surface; color: $text-muted; border: none; min-width: 14; padding: 0 2; }
-    .tab.active { background: $accent; color: $background; }
-    .tab-add    { height: 1; background: $surface; color: $text-muted; border: none; min-width: 4; }
+    /* inactive tab */
+    .tab {
+        height: 1;
+        background: $panel;
+        color: $text-muted;
+        border: none;
+        border-right: solid $primary-darken-3;
+        min-width: 18;
+        padding: 0 1;
+    }
+    /* active tab — bright accent, bold, left accent stripe via label */
+    .tab.active {
+        background: $accent-darken-1;
+        color: $text;
+        text-style: bold;
+        border-right: solid $primary-darken-3;
+    }
+    /* + button */
+    .tab-add {
+        height: 1;
+        background: $panel;
+        color: $text-muted;
+        border: none;
+        min-width: 5;
+        padding: 0 1;
+    }
+    /* shown only when there are no projects */
+    .tab-hint {
+        height: 1;
+        color: $text-muted;
+        padding: 0 2;
+        width: 1fr;
+    }
     """
 
     class TabPressed(Message):
@@ -990,40 +1098,58 @@ class ProjectTabBar(Static):
 
     def __init__(self, projects: list[Project], active_idx: int, **kwargs) -> None:
         super().__init__(**kwargs)
-        self._projects  = projects
-        self._active    = active_idx
+        self._projects = projects
+        self._active   = active_idx
 
     def compose(self) -> ComposeResult:
+        # Persistent hint — shown only when project list is empty
+        yield Label(
+            "  No projects open  ·  press [bold]o[/bold] to open a directory",
+            id="tb-hint",
+            classes="tab-hint",
+        )
         yield from self._make_buttons()
+
+    def _tab_label(self, i: int, name: str) -> str:
+        num = str(i + 1) if i < 9 else "·"
+        if i == self._active:
+            return f" ▶ {num} {name} "
+        return f"   {num} {name} "
 
     def _make_buttons(self):
         for i, p in enumerate(self._projects):
             cls = "tab active" if i == self._active else "tab"
-            yield Button(f" {p.name} ", id=f"ptab-{i}", classes=cls)
+            yield Button(self._tab_label(i, p.name), id=f"ptab-{i}", classes=cls)
         yield Button(" + ", id="ptab-add", classes="tab-add")
 
     def refresh_tabs(self, projects: list[Project], active_idx: int) -> None:
         self._projects = projects
         self._active   = active_idx
-        # Update existing buttons in-place to avoid DuplicateIds from async removal
-        existing_tabs = {b.id: b for b in self.query(Button)}
-        new_buttons = list(self._make_buttons())
-        new_ids = {b.id for b in new_buttons}
 
-        # Remove buttons that no longer exist
-        for bid, btn in existing_tabs.items():
+        # Show/hide the empty-state hint
+        hint = self.query_one("#tb-hint", Label)
+        hint.display = not bool(projects)
+
+        # Update buttons in-place (avoids DuplicateIds from async removal)
+        existing = {b.id: b for b in self.query(Button)}
+        new_btns  = list(self._make_buttons())
+        new_ids   = {b.id for b in new_btns}
+
+        for bid, btn in existing.items():
             if bid not in new_ids:
                 btn.remove()
 
-        # Update or mount new buttons
-        for btn in new_buttons:
-            if btn.id in existing_tabs:
-                old = existing_tabs[btn.id]
+        for btn in new_btns:
+            if btn.id in existing:
+                old = existing[btn.id]
                 old.label = btn.label
-                # Sync active/inactive class
                 old.set_class("active" in btn.classes, "active")
             else:
                 self.mount(btn)
+
+    def on_mount(self) -> None:
+        # Sync hint visibility on first render
+        self.query_one("#tb-hint", Label).display = not bool(self._projects)
 
     @on(Button.Pressed)
     def _pressed(self, event: Button.Pressed) -> None:
@@ -1161,23 +1287,25 @@ class DirectoryPickerScreen(ModalScreen):
 
     def __init__(self, start_path: str | None = None, **kwargs) -> None:
         super().__init__(**kwargs)
-        import os
-        self._start = start_path or os.path.expanduser("~")
+        # Always root the tree at ~ so the user can navigate anywhere.
+        # start_path is shown in the input as a starting suggestion only.
+        self._tree_root  = os.path.expanduser("~")
+        self._input_init = start_path or self._tree_root
 
     def compose(self) -> ComposeResult:
         with Container(id="dp-container"):
             yield Label(
-                " OPEN PROJECT  [dim]Navigate · Enter on dir = open · Escape = cancel[/dim]",
+                " OPEN PROJECT  [dim]↑↓ tree · Enter = open dir · type path to jump · Escape = cancel[/dim]",
                 id="dp-header",
             )
-            yield DirectoryTree(self._start, id="dp-tree")
+            yield DirectoryTree(self._tree_root, id="dp-tree")
             yield Input(
-                value=self._start,
-                placeholder="or type/paste a path…",
+                value=self._input_init,
+                placeholder="type a path to jump the tree there…",
                 id="dp-input",
             )
             yield Label(
-                " ↑↓ navigate tree · Enter on dir opens · Enter in path field opens",
+                " Tab = focus tree · Enter in input = open · paths update tree as you type",
                 id="dp-footer",
             )
 
@@ -1189,8 +1317,21 @@ class DirectoryPickerScreen(ModalScreen):
     def _node_highlighted(self, event: Tree.NodeHighlighted) -> None:
         node = event.node
         if node.data is not None:
-            path = str(node.data)
-            self.query_one("#dp-input", Input).value = path
+            self.query_one("#dp-input", Input).value = str(node.data)
+
+    # Live re-root the tree as the user types a valid directory path
+    @on(Input.Changed, "#dp-input")
+    def _input_changed(self, event: Input.Changed) -> None:
+        path = os.path.expanduser(event.value.strip())
+        if os.path.isdir(path):
+            tree = self.query_one("#dp-tree", DirectoryTree)
+            tree.path = Path(path)
+
+    # Tab in input → focus tree
+    def on_input_key(self, event: Key) -> None:
+        if event.key == "tab":
+            self.query_one("#dp-tree", DirectoryTree).focus()
+            event.stop()
 
     # File clicked → use its parent directory
     @on(DirectoryTree.FileSelected, "#dp-tree")
@@ -1388,6 +1529,14 @@ class VibeSwipeApp(App[None]):
 
         self.query_one("#status-bar", StatusBar).update_agent(self._agent_type)
         self.query_one("#status-bar", StatusBar).update_perm(self._perm_mode)
+
+        # Restore previous session (agents, layout flags, active project)
+        saved = SessionStore().load()
+        if saved:
+            self._restore_session(saved)
+        else:
+            self._apply_layout()
+
         self._refresh_suggestions()
 
         # Focus the agent panel → command mode
@@ -1399,10 +1548,15 @@ class VibeSwipeApp(App[None]):
                 title="VibeSwipe", timeout=7,
             )
         else:
+            restored_count = sum(
+                len(saved.get("projects", {}).get(p.path, {}).get("agents", []))
+                for p in self._pm.projects
+            ) if saved else 0
+            suffix = f"  · {restored_count} agent(s) restored" if restored_count else ""
             self.notify(
                 f"{self._pm.active.name} — [bold]n[/bold]=new agent  "
-                "[bold]o[/bold]=open project  [bold]P[/bold]=permissions",
-                timeout=4,
+                f"[bold]o[/bold]=open project  [bold]P[/bold]=permissions{suffix}",
+                timeout=5,
             )
 
     # ------------------------------------------------------------------ key handling
@@ -1505,7 +1659,21 @@ class VibeSwipeApp(App[None]):
         self._perm_mode = _PERM_CYCLE[(idx + 1) % len(_PERM_CYCLE)]
         self.query_one("#status-bar", StatusBar).update_perm(self._perm_mode)
         label, _ = _PERM_LABELS[self._perm_mode]
-        self.notify(f"Permission mode → {label}", timeout=3)
+
+        # Apply to every open project immediately — Claude reads settings.local.json
+        # before each tool call, so running agents pick this up on their next tool use.
+        for project in self._pm.projects:
+            if self._agent_type == "claude":
+                if self._perm_mode == "safe":
+                    self._write_pretooluse_hook(project.path)
+                else:
+                    self._remove_pretooluse_hook(project.path)
+
+        self.notify(
+            f"Permission mode → {label}  "
+            "[dim](applied to all open projects)[/dim]",
+            timeout=4,
+        )
 
     # ------------------------------------------------------------------ project actions
 
@@ -1992,6 +2160,22 @@ class VibeSwipeApp(App[None]):
         with open(settings_path, "w") as f:
             _json.dump(settings, f, indent=2)
 
+    def _remove_pretooluse_hook(self, project_path: str) -> None:
+        """Remove the PreToolUse hook from .claude/settings.local.json."""
+        import json as _json
+        settings_path = os.path.join(project_path, ".claude", "settings.local.json")
+        try:
+            with open(settings_path) as f:
+                settings = _json.load(f)
+        except (FileNotFoundError, _json.JSONDecodeError):
+            return
+        hooks = settings.get("hooks", {})
+        hooks.pop("PreToolUse", None)
+        if not hooks:
+            settings.pop("hooks", None)
+        with open(settings_path, "w") as f:
+            _json.dump(settings, f, indent=2)
+
     @work(thread=True)
     def _auto_git_commit(self, project_path: str, prompt: str) -> None:
         import subprocess
@@ -2043,6 +2227,90 @@ class VibeSwipeApp(App[None]):
             n=4,
         )
         self.query_one("#prompt-bar", PromptBar).suggestions = suggestions
+
+    # ------------------------------------------------------------------ session persistence
+
+    def action_quit(self) -> None:
+        """Save session state then quit."""
+        self._save_session()
+        self.exit()
+
+    def _save_session(self) -> None:
+        """Serialize all open agent widgets + UI state to vault/user/session.json."""
+        ap = self.query_one("#agent-panel", AgentPanel)
+        projects_state: dict[str, dict] = {}
+        for project in self._pm.projects:
+            agents = ap.get_agents_for_project(project.name)
+            projects_state[project.path] = {
+                "agents": [w.to_state() for w in agents],
+            }
+        state = {
+            "version": 1,
+            "global": {
+                "active_project_idx": self._pm.active_idx,
+                "permission_mode":    self._perm_mode,
+                "agent_type":         self._agent_type,
+                "show_files":         self._show_files,
+                "show_editor":        self._show_editor,
+                "show_terminal":      self._show_terminal,
+                "show_graph":         self._show_graph,
+            },
+            "projects": projects_state,
+        }
+        try:
+            SessionStore().save(state)
+        except Exception:
+            pass
+
+    def _restore_session(self, state: dict) -> None:
+        """Rebuild agent widgets and UI state from a saved session dict."""
+        if not state:
+            return
+
+        g = state.get("global", {})
+
+        # Restore global UI flags
+        self._perm_mode   = g.get("permission_mode",  self._perm_mode)
+        self._agent_type  = g.get("agent_type",        self._agent_type)
+        self._show_files  = g.get("show_files",        False)
+        self._show_editor = g.get("show_editor",       False)
+        self._show_terminal = g.get("show_terminal",   False)
+        self._show_graph  = g.get("show_graph",        False)
+
+        self.query_one("#status-bar", StatusBar).update_agent(self._agent_type)
+        self.query_one("#status-bar", StatusBar).update_perm(self._perm_mode)
+
+        # Restore agents per project
+        ap      = self.query_one("#agent-panel", AgentPanel)
+        saved_p = state.get("projects", {})
+        for project in self._pm.projects:
+            proj_state = saved_p.get(project.path, {})
+            agents_data = proj_state.get("agents", [])
+            if not agents_data:
+                continue
+            # Ensure container exists for this project
+            ap.switch_project(project.name)
+            ap.restore_agents(project.name, agents_data, self._vault)
+
+        # Re-switch to the last active project
+        active_idx = g.get("active_project_idx", self._pm.active_idx)
+        if 0 <= active_idx < len(self._pm.projects):
+            self._pm.set_active(active_idx)
+
+        # Restore active project's container + panels
+        active = self._pm.active
+        if active:
+            ap.switch_project(active.name)
+            self.query_one("#terminal-panel", TerminalPanel).switch_project(
+                active.name, active.path
+            )
+            self.query_one("#file-browser",  FileBrowserPanel).set_root(active.path)
+            self.query_one("#status-bar",    StatusBar).update_project(active.name)
+            self.query_one("#tab-bar",       ProjectTabBar).refresh_tabs(
+                self._pm.projects, self._pm.active_idx
+            )
+
+        self._apply_layout()
 
 
 # ---------------------------------------------------------------------------
