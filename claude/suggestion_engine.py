@@ -54,6 +54,22 @@ class PromptSuggestionEngine:
                 break
         return list(reversed(result))  # oldest first
 
+    def get_all_prompts(self, n: int = 60) -> list[str]:
+        """Return up to n prompts across ALL projects, oldest first.
+
+        Each entry is formatted as "project: prompt" so the profile
+        analyzer can see which project context each prompt came from.
+        Deduplicates consecutive identical prompts.
+        """
+        result: list[str] = []
+        last: str = ""
+        for proj, prompt, _ in self._recent:
+            entry = f"{proj}: {prompt}"
+            if entry != last:
+                result.append(entry)
+                last = entry
+        return result[-n:]  # oldest first
+
     def get_suggestions(
         self,
         project_name: str,

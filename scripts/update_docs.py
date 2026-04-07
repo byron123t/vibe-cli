@@ -1,13 +1,12 @@
 #!/usr/bin/env python3
 """
-Claude Code Stop hook — auto-updates README.md and CLAUDE.md.
+Claude Code Stop hook — auto-updates README.md and CLAUDE.md, then commits.
 
-Reads the current git diff (excluding the docs themselves), reads both
-docs, then asks Claude to produce updated versions that reflect any
-new features, changed behaviour, or removed code.  Writes the results
-in-place only when the content actually changed.
+Controlled by config.json → hooks.auto_docs (bool, default true).
+Set to false to disable docs updates and auto-commits entirely.
 
 Skips silently if:
+  - hooks.auto_docs is false in config.json
   - ANTHROPIC_API_KEY is not set
   - There are no tracked-file changes (nothing to document)
   - The diff touches only README.md / CLAUDE.md (avoid feedback loop)
@@ -29,12 +28,28 @@ def _git(args: list[str]) -> str:
     return r.stdout.strip()
 
 
+def _is_enabled() -> bool:
+    """Return True unless hooks.auto_docs is explicitly set to false in config.json."""
+    config_path = ROOT / "config.json"
+    if not config_path.exists():
+        return True
+    try:
+        cfg = json.loads(config_path.read_text())
+        return bool(cfg.get("hooks", {}).get("auto_docs", True))
+    except Exception:
+        return True
+
+
 def main() -> None:
     # Read hook payload from stdin (Claude Code passes JSON)
     try:
         payload = json.load(sys.stdin)
     except Exception:
         payload = {}
+
+    if not _is_enabled():
+        print("[update_docs] auto_docs disabled in config.json — skipping", file=sys.stderr)
+        return
 
     api_key = os.environ.get("ANTHROPIC_API_KEY", "")
     if not api_key:
@@ -116,6 +131,21 @@ def main() -> None:
     if new_claude_md and new_claude_md != claude.strip():
         claude_path.write_text(new_claude_md + "\n")
         print("[update_docs] CLAUDE.md updated", file=sys.stderr)
+
+    # Stage all changes and commit
+    _git(["add", "-A"])
+    status = _git(["status", "--porcelain"])
+    if status.strip():
+        session_id = payload.get("session_id", "")[:8]
+        msg = f"[vibe-cli] session update {session_id}".strip()
+        r = subprocess.run(
+            ["git", "-C", str(ROOT), "commit", "-m", msg],
+            capture_output=True, text=True,
+        )
+        if r.returncode == 0:
+            print(f"[update_docs] committed: {msg}", file=sys.stderr)
+        else:
+            print(f"[update_docs] commit failed: {r.stderr.strip()}", file=sys.stderr)
 
 
 if __name__ == "__main__":

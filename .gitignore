@@ -1,6 +1,9 @@
+__pycache__/
 .DS_Store
 .claude/
 CLAUDE.md
 newproj/
 otherproj/
 vault/
+UNKNOWN.egg-info/
+vibe_cli.egg-info/

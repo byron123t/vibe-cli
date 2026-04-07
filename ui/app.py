@@ -1045,48 +1045,76 @@ class GraphPane(Static):
 # ---------------------------------------------------------------------------
 
 class ProjectTabBar(Static):
-    """Top row of project tabs with numbered labels and active indicator."""
+    """macOS Terminal-style project tab bar.
+
+    Layout (height=3):
+      ┌──────────────┐ ┌──────────────┐   ┌──────────────┐  ⊕
+      │  1 · project │ │  2 · other   │   │  3 · third   │
+      └──────────────┘ └──────────────┘   └──────────────┘
+
+    Active tab shares background with content area giving the "open tab"
+    illusion.  Inactive tabs are recessed in $panel.
+    """
 
     DEFAULT_CSS = """
     ProjectTabBar {
-        height: 1;
-        background: $panel;
+        height: 3;
+        background: $panel-darken-2;
         layout: horizontal;
+        align: left bottom;
     }
-    /* inactive tab */
-    .tab {
-        height: 1;
-        background: $panel;
+
+    /* ── inactive tab ─────────────────────────────────────── */
+    ProjectTabBar Button.tab {
+        height: 3;
+        min-width: 16;
+        max-width: 28;
+        padding: 0 2;
+        background: $panel-darken-1;
         color: $text-muted;
-        border: none;
-        border-right: solid $primary-darken-3;
-        min-width: 18;
-        padding: 0 1;
+        border-top: solid $panel-darken-3;
+        border-bottom: solid $panel-darken-2;
+        border-left: none;
+        border-right: solid $panel-darken-3;
+        content-align: center middle;
     }
-    /* active tab — bright accent, bold, left accent stripe via label */
-    .tab.active {
-        background: $accent-darken-1;
+
+    /* ── active tab ───────────────────────────────────────── */
+    ProjectTabBar Button.tab.active {
+        background: $surface;
         color: $text;
         text-style: bold;
-        border-right: solid $primary-darken-3;
+        border-top: wide $accent;
+        border-bottom: solid $surface;
+        border-left: none;
+        border-right: solid $panel-darken-3;
     }
-    /* + button */
-    .tab-add {
-        height: 1;
-        background: $panel;
+
+    /* ── + / new-project button ───────────────────────────── */
+    ProjectTabBar Button.tab-add {
+        height: 3;
+        min-width: 5;
+        padding: 0 2;
+        background: $panel-darken-2;
         color: $text-muted;
         border: none;
-        min-width: 5;
-        padding: 0 1;
+        content-align: center middle;
     }
-    /* shown only when there are no projects */
-    .tab-hint {
-        height: 1;
+    ProjectTabBar Button.tab-add:hover {
+        color: $text;
+    }
+
+    /* ── empty-state hint ─────────────────────────────────── */
+    ProjectTabBar .tab-hint {
+        height: 3;
         color: $text-muted;
-        padding: 0 2;
+        padding: 0 3;
         width: 1fr;
+        content-align: left middle;
     }
     """
+
+    _MAX_NAME = 16   # chars before truncation
 
     class TabPressed(Message):
         def __init__(self, idx: int) -> None:
@@ -1101,41 +1129,47 @@ class ProjectTabBar(Static):
         self._projects = projects
         self._active   = active_idx
 
+    # ── label helpers ─────────────────────────────────────────────────
+
+    @staticmethod
+    def _trunc(name: str, limit: int) -> str:
+        return name if len(name) <= limit else name[: limit - 1] + "…"
+
+    def _tab_label(self, i: int, name: str) -> str:
+        num  = str(i + 1) if i < 9 else "·"
+        disp = self._trunc(name, self._MAX_NAME)
+        return f"{num}  {disp}"
+
+    # ── compose ──────────────────────────────────────────────────────
+
     def compose(self) -> ComposeResult:
-        # Persistent hint — shown only when project list is empty
         yield Label(
-            "  No projects open  ·  press [bold]o[/bold] to open a directory",
+            "  No projects  ·  press [bold]o[/bold] to open a directory",
             id="tb-hint",
             classes="tab-hint",
         )
         yield from self._make_buttons()
 
-    def _tab_label(self, i: int, name: str) -> str:
-        num = str(i + 1) if i < 9 else "·"
-        if i == self._active:
-            return f" ▶ {num} {name} "
-        return f"   {num} {name} "
-
     def _make_buttons(self):
         for i, p in enumerate(self._projects):
             cls = "tab active" if i == self._active else "tab"
             yield Button(self._tab_label(i, p.name), id=f"ptab-{i}", classes=cls)
-        yield Button(" + ", id="ptab-add", classes="tab-add")
+        yield Button("⊕", id="ptab-add", classes="tab-add")
+
+    # ── update ───────────────────────────────────────────────────────
 
     def refresh_tabs(self, projects: list[Project], active_idx: int) -> None:
         self._projects = projects
         self._active   = active_idx
 
-        # Show/hide the empty-state hint
         hint = self.query_one("#tb-hint", Label)
         hint.display = not bool(projects)
 
-        # Update buttons in-place (avoids DuplicateIds from async removal)
         existing = {b.id: b for b in self.query(Button)}
         new_btns  = list(self._make_buttons())
         new_ids   = {b.id for b in new_btns}
 
-        for bid, btn in existing.items():
+        for bid, btn in list(existing.items()):
             if bid not in new_ids:
                 btn.remove()
 
@@ -1148,8 +1182,9 @@ class ProjectTabBar(Static):
                 self.mount(btn)
 
     def on_mount(self) -> None:
-        # Sync hint visibility on first render
         self.query_one("#tb-hint", Label).display = not bool(self._projects)
+
+    # ── events ───────────────────────────────────────────────────────
 
     @on(Button.Pressed)
     def _pressed(self, event: Button.Pressed) -> None:
@@ -1991,17 +2026,17 @@ class VibeSwipeApp(App[None]):
         except Exception:
             pass
 
-        # 5. Update user profile via LLM (skip if SDK unavailable)
+        # 5. Update user profile via LLM (always runs when SDK is available)
         new_profile = ""
         if self._profile_analyzer.is_available():
             try:
-                recent_prompts = self._sugg.get_recent_prompts(project, n=10)
+                all_prompts     = self._sugg.get_all_prompts(n=60)
                 current_profile = self._user_profile.read()
                 new_profile = self._profile_analyzer.update_profile(
                     prompt=prompt,
                     output_tail=output_tail,
                     project=project,
-                    recent_prompts=recent_prompts,
+                    all_prompts=all_prompts,
                     current_profile=current_profile,
                 )
                 if new_profile:
@@ -2014,7 +2049,7 @@ class VibeSwipeApp(App[None]):
         if self._profile_analyzer.is_available():
             try:
                 profile_text   = new_profile or self._user_profile.read()
-                recent_prompts = self._sugg.get_recent_prompts(project, n=8)
+                recent_prompts = self._sugg.get_recent_prompts(project, n=12)
                 suggestions    = self._profile_analyzer.predict_prompts(
                     profile=profile_text,
                     project=project,

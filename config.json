@@ -18,6 +18,9 @@
     "max_agents_per_project": 8,
     "suggestions_count": 4
   },
+  "hooks": {
+    "auto_docs": true
+  },
   "personalization": {
     "recency_half_life_days": 7.0,
     "decay_interval_hours": 24,
