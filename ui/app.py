@@ -399,12 +399,14 @@ class AgentWidget(Static):
     def __init__(self, session: AgentSession, number: int,
                  vault: "MemoryVault | None" = None,
                  restore: "dict | None" = None,
+                 agent_type: str = "claude",
                  **kwargs) -> None:
         super().__init__(**kwargs)
         self.session  = session          # original session — stable, never replaced
         self.number   = number
         self._vault   = vault
         self._restore = restore          # saved state dict; if set, skip running
+        self._agent_type = agent_type    # "claude" | "codex" | "cursor"
         self._log:    RichLog | None = None
         self._ta:     SelectableLog | None = None
         self._status: Label | None = None
@@ -470,6 +472,7 @@ class AgentWidget(Static):
                                     or self.session.captured_session_id),
             "project_path":       self.session.project_path,
             "permission_mode":    self.session.permission_mode,
+            "agent_type":         self._agent_type,
             "exit_code":          active.exit_code,
             "output":             SessionStore.cap_output(self._full_lines),
         }
@@ -571,8 +574,13 @@ class AgentWidget(Static):
         reply_input = self.query_one(f"#agent-reply-{sid}", Input)
         reply_input.display = False
 
-        # Preserve the same agent type (Claude/Codex/Cursor) for the continuation
-        session_cls = type(self._active_session)
+        # Use the stored agent type — never use type(self._active_session) since
+        # restored sessions are RestoredSession which returns instantly on run().
+        from terminal.claude_session import ClaudeSession
+        from terminal.codex_session  import CodexSession
+        from terminal.cursor_session import CursorSession
+        _cls_map = {"claude": ClaudeSession, "codex": CodexSession, "cursor": CursorSession}
+        session_cls = _cls_map.get(self._agent_type, ClaudeSession)
         continuation = session_cls(
             prompt=reply,
             project_path=self._active_session.project_path,
@@ -693,13 +701,15 @@ class AgentPanel(Static, can_focus=True):
             hint.display = not has_agents
 
     def add_agent(self, session: AgentSession,
-                  vault: "MemoryVault | None" = None) -> AgentWidget:
+                  vault: "MemoryVault | None" = None,
+                  agent_type: str = "claude") -> AgentWidget:
         container = self._active_container()
         self._project_counts[self._active_project] = (
             self._project_counts.get(self._active_project, 0) + 1
         )
         count  = self._project_counts[self._active_project]
         widget = AgentWidget(session, number=count, vault=vault,
+                             agent_type=agent_type,
                              id=f"agent-{session.session_id}")
         container.mount(widget)
         container.scroll_end(animate=False)
@@ -770,6 +780,7 @@ class AgentPanel(Static, can_focus=True):
             widget  = AgentWidget(
                 session, number=num, vault=vault,
                 restore=data,
+                agent_type=data.get("agent_type", "claude"),
                 id=f"agent-{session.session_id}",
             )
             container.mount(widget)
@@ -1981,7 +1992,9 @@ class VibeCLIApp(App[None]):
             self._write_pretooluse_hook(active.path)
 
         session = self._make_session(prompt, active.path)
-        self.query_one("#agent-panel", AgentPanel).add_agent(session, vault=self._vault)
+        self.query_one("#agent-panel", AgentPanel).add_agent(
+            session, vault=self._vault, agent_type=self._agent_type
+        )
 
         if self._show_graph:
             self._show_graph = False
@@ -2116,23 +2129,38 @@ class VibeCLIApp(App[None]):
         except Exception:
             pass
 
-        # 6. Update global user profile (demographics, personality, interests, behavior)
-        new_profile = ""
-        if self._profile_analyzer.is_available():
-            try:
-                all_prompts     = self._sugg.get_all_prompts(n=60)
-                current_profile = self._user_profile.read()
-                new_profile = self._profile_analyzer.update_profile(
+        # 6. Forensic profile update — always writes, LLM enriches when available
+        try:
+            all_prompts = self._sugg.get_all_prompts(n=80)
+            # Start from existing profile or build a fresh basic one
+            current_profile = self._user_profile.read_json()
+            if not current_profile:
+                current_profile = self._profile_analyzer.build_basic_profile(all_prompts)
+
+            if self._profile_analyzer.is_available():
+                # Full LLM forensic analysis
+                enriched = self._profile_analyzer.build_forensic_profile(
                     prompt=prompt,
-                    output_tail=output_tail,
                     project=project,
                     all_prompts=all_prompts,
                     current_profile=current_profile,
                 )
-                if new_profile:
-                    self._user_profile.write(new_profile)
-            except Exception:
-                pass
+                new_profile_json = enriched if enriched else current_profile
+            else:
+                # Non-LLM keyword analysis — merge over existing
+                basic = self._profile_analyzer.build_basic_profile(all_prompts)
+                # Merge: keep existing rich fields, update observable ones
+                new_profile_json = {**basic, **{
+                    k: current_profile.get(k, basic.get(k, {}))
+                    for k in ("demographics", "personality", "inferences")
+                }}
+                new_profile_json["technical_interests"] = basic["technical_interests"]
+                new_profile_json["behavioral_patterns"] = basic["behavioral_patterns"]
+                new_profile_json["prompting_style"]     = basic["prompting_style"]
+
+            self._user_profile.write_json(new_profile_json)
+        except Exception:
+            pass
 
         # 7. Update per-project profile (summary, tech stack, current focus)
         if self._profile_analyzer.is_available():
@@ -2155,10 +2183,10 @@ class VibeCLIApp(App[None]):
         suggestions: list[str] = []
         if self._profile_analyzer.is_available():
             try:
-                profile_text   = new_profile or self._user_profile.read()
+                profile_dict   = self._user_profile.read_json()
                 recent_prompts = self._sugg.get_recent_prompts(project, n=12)
                 suggestions    = self._profile_analyzer.predict_prompts(
-                    profile=profile_text,
+                    profile=profile_dict,
                     project=project,
                     last_prompt=prompt,
                     output_tail=output_tail,
