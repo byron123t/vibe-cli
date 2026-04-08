@@ -1,4 +1,4 @@
-"""UserProfile — persistent behavioral profile for the VibeSwipe user.
+"""UserProfile — persistent behavioral profile for the VibeCLI user.
 
 Global profile: vault/user/profile.md
   Tracks demographics, personality traits, technical interests, behavioral
@@ -17,9 +17,9 @@ from memory.vault import MemoryVault
 
 
 _GLOBAL_TEMPLATE = """\
-# VibeSwipe User Profile
+# VibeCLI User Profile
 
-_Maintained automatically by VibeSwipe after each agent run. Do not edit by hand._
+_Maintained automatically by VibeCLI after each agent run. Do not edit by hand._
 
 **Last updated:** —
 
@@ -45,7 +45,7 @@ _Not yet observed._
 _PROJECT_TEMPLATE = """\
 # Project Profile: {project}
 
-_Maintained automatically by VibeSwipe after each agent run._
+_Maintained automatically by VibeCLI after each agent run._
 
 **Last updated:** —
 

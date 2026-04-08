@@ -12,7 +12,7 @@ class AgentSession(ABC):
     """
     Common interface for Claude, Codex, and Cursor agent sessions.
 
-    Each subclass wraps a specific CLI tool and maps the three VibeSwipe
+    Each subclass wraps a specific CLI tool and maps the three VibeCLI
     permission modes (safe / accept_edits / bypass) to that tool's flags.
     """
 

@@ -24,7 +24,7 @@ def _strip_ansi(text: str) -> str:
     return re.sub(r"\x1b\[[0-9;]*[mKHFABCDJG]", "", text)
 
 
-# Maps VibeSwipe permission modes → codex --approval-mode values
+# Maps VibeCLI permission modes → codex --approval-mode values
 _APPROVAL: dict[str, list[str]] = {
     "safe":         ["--approval-mode", "suggest"],
     "accept_edits": ["--approval-mode", "auto-edit"],

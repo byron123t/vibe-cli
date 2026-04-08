@@ -26,7 +26,7 @@ class MOCManager:
         return Note.create_new(
             path=path,
             title=f"MOC - {topic}",
-            body=f"# {topic} MOC\n\n_This Map of Content is auto-maintained by VibeSwipe._\n",
+            body=f"# {topic} MOC\n\n_This Map of Content is auto-maintained by VibeCLI._\n",
             tags=["moc", topic.lower().replace(" ", "_")],
             note_type="moc",
         )
@@ -41,7 +41,7 @@ class MOCManager:
         )
         body = (
             f"# {topic} MOC\n\n"
-            f"_Auto-maintained by VibeSwipe. Last updated: {datetime.utcnow().strftime('%Y-%m-%d %H:%M')} UTC_\n\n"
+            f"_Auto-maintained by VibeCLI. Last updated: {datetime.utcnow().strftime('%Y-%m-%d %H:%M')} UTC_\n\n"
             f"## Notes\n\n{links_section or '_No notes yet._'}\n"
         )
 
@@ -72,8 +72,8 @@ class MOCManager:
         )
 
         body = (
-            "# VibeSwipe Memory Index\n\n"
-            "_Master index of all Maps of Content. Auto-maintained by VibeSwipe._\n\n"
+            "# VibeCLI Memory Index\n\n"
+            "_Master index of all Maps of Content. Auto-maintained by VibeCLI._\n\n"
             "## Vault Statistics\n\n" + stats + "\n"
             "## Maps of Content\n\n" + (moc_links or "_No MOCs yet._") + "\n"
         )

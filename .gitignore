@@ -7,3 +7,4 @@ otherproj/
 vault/
 UNKNOWN.egg-info/
 vibe_cli.egg-info/
+*.pyc

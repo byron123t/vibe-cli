@@ -1,4 +1,4 @@
-"""VibeSwipe TUI — modal, keyboard-first multi-project Claude Code interface.
+"""VibeCLI TUI — modal, keyboard-first multi-project Claude Code interface.
 
 Modes
 ─────
@@ -39,6 +39,7 @@ from __future__ import annotations
 
 import asyncio
 import os
+import re
 import subprocess
 import sys
 from pathlib import Path
@@ -147,28 +148,62 @@ class AgentMemoryWidget(Static):
     }
     """
 
-    def __init__(self, prompt: str, vault: "MemoryVault | None", **kwargs) -> None:
+    def __init__(self, prompt: str, vault: "MemoryVault | None",
+                 project: str = "", **kwargs) -> None:
         super().__init__(**kwargs)
-        self._prompt = prompt
-        self._vault = vault
+        self._prompt  = prompt
+        self._vault   = vault
+        self._project = project
 
     def on_mount(self) -> None:
         self._populate()
 
     def _populate(self) -> None:
         if not self._vault:
-            self.update("[dim]♦ Memory: (no vault)[/dim]")
+            self.update("[dim]♦ (no vault)[/dim]")
             return
-        keywords = [w for w in self._prompt.split() if len(w) > 3][:6]
-        seen: set[str] = set()
-        for kw in keywords:
-            for note in self._vault.search(kw)[:2]:
-                seen.add(note.title)
-        if seen:
-            links = "  ".join(f"[[{t}]]" for t in list(seen)[:4])
-            self.update(f"[dim]♦ Memory: {links}[/dim]")
+
+        parts: list[str] = []
+
+        # 1. Project profile summary (first non-empty content line after headings)
+        if self._project:
+            prof_path = os.path.join(
+                self._vault.root, "projects", self._project, "profile.md"
+            )
+            if os.path.isfile(prof_path):
+                try:
+                    with open(prof_path, encoding="utf-8") as f:
+                        ptext = f.read()
+                    # Extract Summary section value
+                    m = re.search(r"## Summary\s+(.+?)(?=\n##|\Z)", ptext, re.DOTALL)
+                    if m:
+                        snippet = m.group(1).strip().split("\n")[0]
+                        if snippet and "_Not yet observed_" not in snippet:
+                            parts.append(f"[dim italic]{snippet[:90]}[/dim italic]")
+                except Exception:
+                    pass
+
+        # 2. Recent tag cloud from this project's run logs
+        if self._project:
+            proj_notes = self._vault.get_project_notes(self._project)
+            run_logs = sorted(
+                [n for n in proj_notes if "run_log" in n.tags],
+                key=lambda n: n.modified_at, reverse=True,
+            )
+            tag_counts: dict[str, int] = {}
+            skip = {"run_log", self._project, "run_outputs"}
+            for note in run_logs[:10]:
+                for t in note.tags:
+                    if t not in skip:
+                        tag_counts[t] = tag_counts.get(t, 0) + 1
+            if tag_counts:
+                top_tags = sorted(tag_counts, key=lambda t: -tag_counts[t])[:6]
+                parts.append("[dim]" + "  ".join(f"#{t}" for t in top_tags) + "[/dim]")
+
+        if parts:
+            self.update("  ".join(parts))
         else:
-            self.update("[dim]♦ Memory: (no related notes)[/dim]")
+            self.update("[dim]♦ (no project memory yet)[/dim]")
 
 
 # ---------------------------------------------------------------------------
@@ -392,7 +427,9 @@ class AgentWidget(Static):
             id=f"agent-reply-{sid}",
             classes="agent-reply",
         )
+        proj_name = os.path.basename(self.session.project_path.rstrip("/"))
         yield AgentMemoryWidget(self.session.prompt, self._vault,
+                                project=proj_name,
                                 id=f"agent-mem-{sid}")
 
     def on_mount(self) -> None:
@@ -1017,21 +1054,53 @@ class GraphPane(Static):
             tree.root.add_leaf("(no vault)")
             tree.root.expand()
             return
-        notes = self._vault.all_notes()
-        if not notes:
-            tree.root.add_leaf("(vault is empty)")
-            tree.root.expand()
-            return
-        by_dir: dict[str, list] = {}
-        for note in notes:
-            rel = self._vault.rel_path(note)
-            folder = Path(rel).parts[0] if len(Path(rel).parts) > 1 else ""
-            by_dir.setdefault(folder, []).append(note)
-        for folder in sorted(by_dir):
-            node = tree.root.add(f"[bold]{folder}[/bold]") if folder else tree.root
-            for note in sorted(by_dir[folder], key=lambda n: n.title):
-                leaf = node.add_leaf(note.title)
-                leaf.data = note.path
+
+        # --- Per-project branches ---
+        projects = self._vault.list_projects()
+        if projects:
+            proj_root = tree.root.add("[bold]Projects[/bold]")
+            for proj in sorted(projects):
+                pnode = proj_root.add(f"[cyan]{proj}[/cyan]")
+                # Project profile (if it exists)
+                prof_path = os.path.join(
+                    self._vault.root, "projects", proj, "profile.md"
+                )
+                if os.path.isfile(prof_path):
+                    leaf = pnode.add_leaf("[dim]Profile[/dim]")
+                    leaf.data = prof_path
+                # Recent run logs (last 8, newest first)
+                proj_notes = self._vault.get_project_notes(proj)
+                run_logs = sorted(
+                    [n for n in proj_notes if "run_log" in n.tags],
+                    key=lambda n: n.modified_at,
+                    reverse=True,
+                )
+                for note in run_logs[:8]:
+                    label = note.title
+                    # Show tags after the title if present
+                    semantic = [t for t in note.tags
+                                if t not in ("run_log", proj, "run_outputs")]
+                    if semantic:
+                        label += f"  [dim]{' '.join('#'+t for t in semantic[:3])}[/dim]"
+                    leaf = pnode.add_leaf(label)
+                    leaf.data = note.path
+                proj_root.expand()
+                pnode.expand()
+
+        # --- User profile ---
+        prof_path = os.path.join(self._vault.root, "user", "profile.md")
+        if os.path.isfile(prof_path):
+            leaf = tree.root.add_leaf("[bold]User Profile[/bold]")
+            leaf.data = prof_path
+
+        # --- MOCs (collapsed by default) ---
+        mocs = self._vault.list_mocs()
+        if mocs:
+            moc_root = tree.root.add("[bold]MOCs[/bold]")
+            for moc in sorted(mocs, key=lambda m: m.title):
+                leaf = moc_root.add_leaf(f"[dim]{moc.title}[/dim]")
+                leaf.data = moc.path
+
         tree.root.expand()
 
     @on(Tree.NodeSelected)
@@ -1455,7 +1524,7 @@ class StatusBar(Static):
 # Main App
 # ---------------------------------------------------------------------------
 
-class VibeSwipeApp(App[None]):
+class VibeCLIApp(App[None]):
 
     CSS = """
     Screen { layout: vertical; }
@@ -1502,7 +1571,7 @@ class VibeSwipeApp(App[None]):
         self._sugg   = PromptSuggestionEngine(self._pers)
 
         self._auto_commit    = config.get("git", {}).get("auto_commit", True)
-        self._commit_prefix  = config.get("git", {}).get("commit_message_prefix", "[VibeSwipe] ")
+        self._commit_prefix  = config.get("git", {}).get("commit_message_prefix", "[VibeCLI] ")
 
         # Agent type: "claude" | "codex" | "cursor"
         self._agent_type: str = config.get("agent", {}).get("type", "claude")
@@ -1580,7 +1649,7 @@ class VibeSwipeApp(App[None]):
         if not self._pm.projects:
             self.notify(
                 "No projects yet.  Press [bold]o[/bold] to open a project directory.",
-                title="VibeSwipe", timeout=7,
+                title="VibeCLI", timeout=7,
             )
         else:
             restored_count = sum(
@@ -2115,6 +2184,15 @@ class VibeSwipeApp(App[None]):
                 "suggestions",
                 blended,
             )
+
+        # 10. Refresh memory graph pane if visible
+        if self._show_graph:
+            try:
+                self.call_from_thread(
+                    self.query_one("#graph-pane", GraphPane)._populate
+                )
+            except Exception:
+                pass
 
     # ------------------------------------------------------------------ permission decisions
 

@@ -4,7 +4,7 @@
   },
   "claude": {
     "model": "claude-sonnet-4-6",
-    "max_tokens": 16384,
+    "max_tokens": 65536,
     "permission_mode": "accept_edits"
   },
   "vault": {
@@ -12,7 +12,7 @@
   },
   "git": {
     "auto_commit": true,
-    "commit_message_prefix": "[VibeSwipe] "
+    "commit_message_prefix": "[VibeCLI] "
   },
   "ui": {
     "max_agents_per_project": 8,

@@ -11,12 +11,12 @@ vibe-cli is a keyboard-first, modal TUI for managing multiple AI coding agents c
 ## Directory Layout
 
 ```
-vibeswipe/
+vibe-cli/
 ├── main.py                       # Entry point — config loading, CLI args, app startup
 ├── config.json                   # Runtime configuration (model, vault root, git, UI)
 │
 ├── ui/
-│   └── app.py                    # Entire TUI: all widgets + VibeSwipeApp controller (2,329 lines)
+│   └── app.py                    # Entire TUI: all widgets + VibeCLIApp controller (2,329 lines)
 │
 ├── core/
 │   ├── project_manager.py        # Multi-project CRUD + active-project state
@@ -61,11 +61,11 @@ vibeswipe/
 
 ### 1. UI Layer (`ui/app.py`)
 
-All widgets live in a single file. The `VibeSwipeApp` class owns the application lifecycle, project switching, agent spawning, and keybindings.
+All widgets live in a single file. The `VibeCLIApp` class owns the application lifecycle, project switching, agent spawning, and keybindings.
 
 | Widget | Description |
 |--------|-------------|
-| `VibeSwipeApp` | Root app — coordinates all subsystems, owns async work loops |
+| `VibeCLIApp` | Root app — coordinates all subsystems, owns async work loops |
 | `ProjectTabBar` | Top tab row; `1`–`9` to switch, `+` to add |
 | `AgentPanel` | Per-project scrollable stack of `AgentWidget`s |
 | `AgentWidget` | One agent session: streaming `RichLog` → `SelectableLog` on complete |
@@ -206,7 +206,7 @@ User presses Enter (Prompt mode)
 PromptBar emits PromptSubmitted
         │
         ▼
-VibeSwipeApp._on_prompt()
+VibeCLIApp._on_prompt()
   ├─ PersonalizationGraph.record_use()
   ├─ AgentPanel.add_agent()            → new AgentWidget created
   └─ _run_session() [@work async]

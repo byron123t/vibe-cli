@@ -54,7 +54,7 @@ def main() -> None:
     config = load_config(config_path)
     os.chdir(script_dir)
 
-    from ui.app import VibeSwipeApp
+    from ui.app import VibeCLIApp
     from core.project_manager import ProjectManager
 
     # Pre-add any projects from --add flag
@@ -68,7 +68,7 @@ def main() -> None:
             else:
                 print(f"  [!] Not a directory, skipping: {path}")
 
-    app = VibeSwipeApp(config)
+    app = VibeCLIApp(config)
     app.run()
 
 
