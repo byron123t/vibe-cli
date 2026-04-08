@@ -1,0 +1,19 @@
+### TODOS
+- [ ] `man` option with details
+- [ ] Memory/brain importing
+- [ ] LLM-powered user profiling and prompt personalization
+- [ ] Remote ssh support
+- [ ] Plan mode
+- [ ] Manually setting [1-9] keyboard prompt shortcuts
+- [ ] More support for agent commands (claude-native command format) /fork, /effort, etc.)
+- [ ] More support for parameters (max $, model, session id, etc.)
+- [ ] Tests for cursor and codex
+- [ ] Updated screenshots and screen recording gifs
+- [ ] Support and tests for agent orchestration (/agents)
+- [ ] Support and tests for tooling
+- [ ] Proper package shipping to node and/or pip
+
+### Refs
+- [https://code.claude.com/docs/en/cli-reference](https://code.claude.com/docs/en/cli-reference)
+- [https://cursor.com/docs/cli/overview](https://cursor.com/docs/cli/overview)
+- [https://developers.openai.com/codex/cli/reference](https://developers.openai.com/codex/cli/reference)
