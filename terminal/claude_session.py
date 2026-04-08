@@ -6,10 +6,21 @@ Uses --print --output-format stream-json for structured streaming output:
 
 Permissions in --print mode
 ----------------------------
-Claude Code does NOT emit permission_request events in --print mode.
-VibeSwipe handles permissions via a PreToolUse HTTP hook: before executing
-any tool, Claude POSTs to ApprovalServer which shows a TUI prompt and blocks
-until the user approves or denies.  See terminal/approval_server.py.
+Claude Code does NOT emit permission_request events in --print mode, and
+--permission-mode flag behaviour in non-interactive mode is unpredictable
+(may auto-approve Bash/network tools in ways the user didn't intend).
+
+Instead, vibe-cli installs a PreToolUse HTTP hook for both "safe" and
+"accept_edits" modes.  Every tool call is POST-ed to ApprovalServer which
+decides (based on the current permission mode) whether to auto-approve, show
+a TUI prompt, or auto-deny.
+
+  safe         — every tool surfaces a TUI PermissionPrompt
+  accept_edits — file tools (Read/Write/Edit/…) are silently auto-approved;
+                 Bash, WebFetch, WebSearch still show the TUI prompt
+  bypass       — --dangerously-skip-permissions, no hook installed
+
+See terminal/approval_server.py and ACCEPT_EDITS_AUTO_APPROVE below.
 """
 from __future__ import annotations
 
@@ -25,13 +36,32 @@ def _strip_ansi(text: str) -> str:
     return re.sub(r"\x1b\[[0-9;]*[mKHFABCDJG]", "", text)
 
 
-# Maps VibeSwipe permission modes → claude CLI flags
-# "safe" uses no flags — permissions are handled by the PreToolUse HTTP hook.
+# Maps vibe-cli permission modes → claude CLI flags.
+#
+# "safe" and "accept_edits" both use no bypass flags.  All tool-call gating is
+# handled by the PreToolUse HTTP hook (ApprovalServer) so we always have an
+# explicit decision path rather than relying on --permission-mode behaviour in
+# non-interactive (--print) mode, which can be unpredictable.
+#
+# "accept_edits" auto-approves file-manipulation tools silently inside the
+# app's _on_tool_approval_request callback; Bash and network tools still show
+# the TUI PermissionPrompt.
+#
+# "bypass" is the only mode that skips permissions entirely.
 PERMISSION_FLAGS: dict[str, list[str]] = {
     "safe":         [],
-    "accept_edits": ["--permission-mode", "acceptEdits"],
+    "accept_edits": [],                          # hook handles approval, not the CLI flag
     "bypass":       ["--dangerously-skip-permissions"],
 }
+
+# Tools auto-approved in "accept_edits" mode.
+# These are read/write file operations that are trivially reversible via git.
+# Any tool NOT in this set still shows the user a TUI confirmation prompt.
+ACCEPT_EDITS_AUTO_APPROVE: frozenset[str] = frozenset({
+    "Read", "Write", "Edit", "MultiEdit",
+    "Glob", "Grep", "LS",
+    "TodoWrite", "TodoRead",
+})
 
 
 class ClaudeSession(AgentSession):

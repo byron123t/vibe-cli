@@ -1697,9 +1697,12 @@ class VibeSwipeApp(App[None]):
 
         # Apply to every open project immediately — Claude reads settings.local.json
         # before each tool call, so running agents pick this up on their next tool use.
+        # Both "safe" and "accept_edits" use the PreToolUse HTTP hook; the difference
+        # is that "accept_edits" auto-approves file tools in _on_tool_approval_request.
+        # Only "bypass" removes the hook entirely (--dangerously-skip-permissions).
         for project in self._pm.projects:
             if self._agent_type == "claude":
-                if self._perm_mode == "safe":
+                if self._perm_mode in ("safe", "accept_edits"):
                     self._write_pretooluse_hook(project.path)
                 else:
                     self._remove_pretooluse_hook(project.path)
@@ -1903,8 +1906,9 @@ class VibeSwipeApp(App[None]):
         self._sugg.record(active.name, prompt)
         self._pers.save()
 
-        # In safe mode, write the PreToolUse HTTP hook so Claude pauses for approval
-        if self._perm_mode == "safe" and self._agent_type == "claude":
+        # "safe" and "accept_edits" both use the PreToolUse HTTP hook.
+        # "bypass" skips it entirely (--dangerously-skip-permissions handles gating).
+        if self._perm_mode in ("safe", "accept_edits") and self._agent_type == "claude":
             self._write_pretooluse_hook(active.path)
 
         session = self._make_session(prompt, active.path)
@@ -1957,12 +1961,14 @@ class VibeSwipeApp(App[None]):
 
         Steps:
         1. Record prompt in suggestion engine
-        2. Log the run to vault (creates a timestamped note)
-        3. Update MOCs + index MOC
-        4. Run vault linter and write any issues to vault
-        5. Update user psychometric profile via LLM
-        6. Generate personalized next-prompt predictions, blended with graph
-        7. Push updated suggestions to the prompt bar
+        2. Generate LLM summary + semantic tags for the run note
+        3. Log the run to vault (timestamped note with summary + tags)
+        4. Update MOCs + index MOC (always)
+        5. Run vault linter and write any issues to vault
+        6. Update global user profile (demographics, personality, interests)
+        7. Update per-project profile (summary, tech stack, current focus)
+        8. Generate personalized next-prompt predictions, blended with graph
+        9. Push updated suggestions to the prompt bar
         """
         prompt      = w.session.prompt
         output_tail: list[str] = list(w.session.output_tail)
@@ -1971,7 +1977,20 @@ class VibeSwipeApp(App[None]):
         # 1. Record in suggestion engine
         self._sugg.record(project, prompt)
 
-        # 2. Log run to vault (also updates MOCs internally)
+        # 2. Generate summary + semantic tags via LLM
+        summary    = ""
+        extra_tags: list[str] = []
+        if self._profile_analyzer.is_available():
+            try:
+                summary, extra_tags = self._profile_analyzer.summarize_run(
+                    prompt=prompt,
+                    output_tail=output_tail,
+                    project=project,
+                )
+            except Exception:
+                pass
+
+        # 3. Log run to vault (also updates project MOC + Run Outputs MOC internally)
         try:
             action_id = prompt[:40].replace(" ", "_").replace("/", "-").lower()
             self._run_logger.log(
@@ -1980,17 +1999,19 @@ class VibeSwipeApp(App[None]):
                 project=project,
                 prompt=prompt,
                 output="\n".join(output_tail),
+                summary=summary,
+                extra_tags=extra_tags,
             )
         except Exception:
             pass
 
-        # 3. Update MOCs (index, since run_logger already updates project MOC)
+        # 4. Update master index MOC (run_logger already updates project + run_outputs MOCs)
         try:
             self._moc.update_index_moc()
         except Exception:
             pass
 
-        # 4. Vault linter
+        # 5. Vault linter
         try:
             linker = Linker(self._vault)
             linter = VaultLinter(self._vault, linker)
@@ -2026,7 +2047,7 @@ class VibeSwipeApp(App[None]):
         except Exception:
             pass
 
-        # 5. Update user profile via LLM (always runs when SDK is available)
+        # 6. Update global user profile (demographics, personality, interests, behavior)
         new_profile = ""
         if self._profile_analyzer.is_available():
             try:
@@ -2044,7 +2065,24 @@ class VibeSwipeApp(App[None]):
             except Exception:
                 pass
 
-        # 6. Personalized next-prompt predictions
+        # 7. Update per-project profile (summary, tech stack, current focus)
+        if self._profile_analyzer.is_available():
+            try:
+                current_proj_profile = self._user_profile.read_project(project)
+                recent_proj_prompts  = self._sugg.get_recent_prompts(project, n=20)
+                new_proj_profile = self._profile_analyzer.update_project_profile(
+                    prompt=prompt,
+                    output_tail=output_tail,
+                    project=project,
+                    recent_prompts=recent_proj_prompts,
+                    current_profile=current_proj_profile,
+                )
+                if new_proj_profile:
+                    self._user_profile.write_project(project, new_proj_profile)
+            except Exception:
+                pass
+
+        # 8. Personalized next-prompt predictions
         suggestions: list[str] = []
         if self._profile_analyzer.is_available():
             try:
@@ -2070,7 +2108,7 @@ class VibeSwipeApp(App[None]):
         blended = suggestions + [s for s in graph_suggestions if s not in suggestions]
         blended = blended[:4]
 
-        # 7. Push to prompt bar
+        # 9. Push to prompt bar
         if blended:
             self.call_from_thread(
                 self.query_one("#prompt-bar", PromptBar).__setattr__,
@@ -2110,10 +2148,22 @@ class VibeSwipeApp(App[None]):
     def _on_tool_approval_request(self, request_id: str, payload: dict) -> None:
         """
         Called by ApprovalServer when Claude's PreToolUse hook fires.
-        Surfaces a PermissionPrompt widget on the currently running agent.
+
+        In "accept_edits" mode, file-manipulation tools (Read, Write, Edit, …)
+        are silently auto-approved.  Only Bash, network, and other potentially
+        destructive tools surface the TUI PermissionPrompt.
+
+        In "safe" mode, every tool surfaces the TUI PermissionPrompt.
         """
+        from terminal.claude_session import ACCEPT_EDITS_AUTO_APPROVE
+
         tool_name  = payload.get("tool_name", "unknown")
         tool_input = payload.get("tool_input", {})
+
+        # "accept_edits": silently allow file-only tools without showing the prompt
+        if self._perm_mode == "accept_edits" and tool_name in ACCEPT_EDITS_AUTO_APPROVE:
+            self._approval_server.respond(request_id, allow=True)
+            return
 
         # Find the most-recently-mounted agent that is still running
         agent = self._find_running_agent()

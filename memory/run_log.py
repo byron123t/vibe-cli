@@ -20,10 +20,18 @@ class RunLogger:
         self._vault = vault
         self._moc   = moc
 
-    def log(self, action_id: str, action_label: str, project: str,
-            prompt: str, output: str,
-            files_modified: list[str] | None = None,
-            duration_seconds: float = 0.0) -> Note:
+    def log(
+        self,
+        action_id: str,
+        action_label: str,
+        project: str,
+        prompt: str,
+        output: str,
+        files_modified: list[str] | None = None,
+        duration_seconds: float = 0.0,
+        summary: str = "",
+        extra_tags: list[str] | None = None,
+    ) -> Note:
         now = datetime.utcnow()
         timestamp_str = now.strftime("%Y-%m-%dT%H-%M-%S")
         safe_action = action_id.replace(".", "_").replace("/", "_")
@@ -34,6 +42,15 @@ class RunLogger:
 
         self._vault.ensure_project(project)
 
+        # Build tags — base set + any LLM-generated semantic tags
+        base_tags = ["run_log", project, safe_action]
+        all_tags  = base_tags + [t for t in (extra_tags or []) if t not in base_tags]
+
+        # Summary section (shown at top if available)
+        summary_section = ""
+        if summary:
+            summary_section = f"## Summary\n\n{summary}\n\n"
+
         files_section = ""
         if files_modified:
             files_section = "\n## Files Modified\n\n" + "\n".join(
@@ -42,6 +59,7 @@ class RunLogger:
 
         body = (
             f"# Run: {action_label} — {now.strftime('%Y-%m-%d %H:%M')}\n\n"
+            f"{summary_section}"
             f"## Prompt\n\n{prompt}\n\n"
             f"## Output\n\n```\n{output}\n```\n"
             f"{files_section}"
@@ -52,12 +70,12 @@ class RunLogger:
             rel_path=rel_path,
             title=f"{now.strftime('%Y-%m-%d %H:%M')} {action_label}",
             body=body,
-            tags=["run_log", project, safe_action],
+            tags=all_tags,
             extra_fm={
-                "project": project,
-                "action": action_id,
+                "project":          project,
+                "action":           action_id,
                 "duration_seconds": round(duration_seconds, 2),
-                "moc_topics": [project, "run_outputs"],
+                "moc_topics":       [project, "run_outputs"],
             },
             note_type="run_log",
         )
@@ -78,9 +96,11 @@ class RunLogger:
         results = []
         for note in run_logs[:n]:
             body = note.body()
-            # Extract text between ## Output markers
-            start = body.find("## Output")
-            if start >= 0:
-                snippet = body[start + 9:start + 600].strip()
-                results.append(snippet)
+            # Prefer the Summary section if present
+            for marker in ("## Summary", "## Output"):
+                start = body.find(marker)
+                if start >= 0:
+                    snippet = body[start + len(marker):start + 500].strip()
+                    results.append(snippet)
+                    break
         return results
