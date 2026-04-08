@@ -4,6 +4,7 @@
 - [ ] LLM-powered user profiling and prompt personalization
 - [ ] Remote ssh support
 - [ ] Plan mode
+- [ ] Cycling between models and effort
 - [ ] Manually setting [1-9] keyboard prompt shortcuts
 - [ ] More support for agent commands (claude-native command format) /fork, /effort, etc.)
 - [ ] More support for parameters (max $, model, session id, etc.)

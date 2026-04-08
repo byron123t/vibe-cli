@@ -16,6 +16,7 @@ Command mode keys
   j / k         scroll agent list down / up
   e             toggle editor panel (read-only view)
   i             enter file edit mode  (only when editor is visible)
+  p             play audio file  (when editor shows a supported audio file)
   m             toggle memory / knowledge graph
   t             toggle terminal panel (show/hide, or focus when open)
   r             run last detected shell command in terminal
@@ -936,8 +937,78 @@ class FileBrowserPanel(Static):
 # EditorPanel
 # ---------------------------------------------------------------------------
 
+# Extensions treated as audio: show metadata + sidecar notes instead of raw bytes.
+_AUDIO_EXTS = frozenset({
+    ".mp3", ".wav", ".flac", ".m4a", ".aac", ".ogg", ".opus", ".webm", ".wma",
+})
+
+
+def _is_audio_file(path: str) -> bool:
+    return Path(path).suffix.lower() in _AUDIO_EXTS
+
+
+def _audio_annotation_path(audio_path: str) -> str:
+    p = Path(audio_path)
+    return str(p.with_name(f"{p.stem}.vibe-annotate.txt"))
+
+
+def _format_hms(seconds: float) -> str:
+    if seconds < 0:
+        seconds = 0.0
+    s = int(round(seconds))
+    m, s = divmod(s, 60)
+    h, m = divmod(m, 60)
+    if h:
+        return f"{h:d}:{m:02d}:{s:02d}"
+    return f"{m:d}:{s:02d}"
+
+
+def _probe_audio_duration_sec(path: str) -> float | None:
+    try:
+        r = subprocess.run(
+            [
+                "ffprobe", "-v", "error", "-show_entries", "format=duration",
+                "-of", "default=noprint_wrappers=1:nokey=1", path,
+            ],
+            capture_output=True, text=True, timeout=8,
+        )
+        if r.returncode == 0 and r.stdout.strip():
+            return float(r.stdout.strip())
+    except Exception:
+        pass
+    if sys.platform == "darwin":
+        try:
+            r = subprocess.run(
+                ["afinfo", path], capture_output=True, text=True, timeout=8,
+            )
+            m = re.search(r"estimated duration:\s*([\d.]+)\s*sec", r.stdout, re.I)
+            if m:
+                return float(m.group(1))
+        except Exception:
+            pass
+    return None
+
+
+def _audio_meta_line(path: str) -> str:
+    p = Path(path)
+    try:
+        st = p.stat()
+        size_kb = st.st_size / 1024.0
+        size_s = f"{size_kb:.1f} KB" if size_kb < 1024 else f"{size_kb / 1024.0:.1f} MB"
+    except OSError:
+        size_s = "?"
+    dur = _probe_audio_duration_sec(path)
+    dur_s = _format_hms(dur) if dur is not None else "duration unknown"
+    return f" [dim]{size_s} · {dur_s} · notes → {Path(_audio_annotation_path(path)).name}[/dim]"
+
+
 class EditorPanel(Static):
-    """Read-only file viewer; press i to enter edit mode."""
+    """Read-only file viewer; press i to enter edit mode.
+
+    Audio files open an annotator: timestamped notes live in a sidecar
+    ``<name>.vibe-annotate.txt`` next to the file. Command mode ``p`` plays
+    the file (afplay / ffplay) when this panel is visible.
+    """
 
     DEFAULT_CSS = """
     EditorPanel {
@@ -951,30 +1022,69 @@ class EditorPanel(Static):
         color: $text-muted;
         padding: 0 1;
     }
+    .ep-audio-meta {
+        height: auto;
+        max-height: 3;
+        background: $surface;
+        color: $text-muted;
+        padding: 0 1;
+    }
     .ep-area { height: 1fr; }
     """
 
     def __init__(self, **kwargs) -> None:
         super().__init__(**kwargs)
         self._current_path = ""
+        self._audio_mode = False
 
     def compose(self) -> ComposeResult:
-        yield Label(" (no file)  [dim]e=close · i=edit[/dim]",
-                    id="ep-label", classes="ep-header")
-        yield TextArea("", id="ep-area", classes="ep-area",
-                       read_only=True, show_line_numbers=True)
+        with Vertical():
+            yield Label(" (no file)  [dim]e=close · i=edit[/dim]",
+                        id="ep-label", classes="ep-header")
+            yield Static("", id="ep-audio-meta", classes="ep-audio-meta")
+            yield TextArea("", id="ep-area", classes="ep-area",
+                           read_only=True, show_line_numbers=True)
+
+    def on_mount(self) -> None:
+        self.query_one("#ep-audio-meta", Static).display = False
 
     def load_file(self, path: str) -> None:
         self._current_path = path
+        self._audio_mode = _is_audio_file(path)
         label = self.query_one("#ep-label", Label)
-        label.update(f" {os.path.basename(path)}  [dim](read-only · i=edit)[/dim]")
-        try:
-            content = Path(path).read_text(errors="replace")
-        except Exception as e:
-            content = f"[Error: {e}]"
+        meta = self.query_one("#ep-audio-meta", Static)
         ta = self.query_one("#ep-area", TextArea)
-        ta.language = _language_for(path)
-        ta.load_text(content)
+
+        if self._audio_mode:
+            meta.display = True
+            meta.update(_audio_meta_line(path))
+            label.update(
+                f" {os.path.basename(path)}  "
+                "[dim]audio · i=edit notes · p=play · e=close[/dim]"
+            )
+            ann = _audio_annotation_path(path)
+            try:
+                if os.path.isfile(ann):
+                    content = Path(ann).read_text(encoding="utf-8", errors="replace")
+                else:
+                    content = (
+                        "# Audio notes (plain text)\n"
+                        "# Use timestamps like 0:42 or 1:23:05 — one line per cue.\n\n"
+                    )
+            except Exception as e:
+                content = f"[Error loading notes: {e}]"
+            ta.language = "markdown"
+            ta.load_text(content)
+        else:
+            meta.display = False
+            meta.update("")
+            label.update(f" {os.path.basename(path)}  [dim](read-only · i=edit)[/dim]")
+            try:
+                content = Path(path).read_text(errors="replace")
+            except Exception as e:
+                content = f"[Error: {e}]"
+            ta.language = _language_for(path)
+            ta.load_text(content)
         ta.read_only = True
 
     def enter_edit_mode(self) -> None:
@@ -982,25 +1092,85 @@ class EditorPanel(Static):
         ta.read_only = False
         ta.focus()
         label = self.query_one("#ep-label", Label)
-        label.update(f" {os.path.basename(self._current_path)}  "
-                     "[bold yellow]EDIT[/bold yellow]  [dim](Escape=save+exit)[/dim]")
+        base = os.path.basename(self._current_path)
+        if self._audio_mode:
+            label.update(
+                f" {base}  [bold yellow]EDIT NOTES[/bold yellow]  "
+                "[dim](Escape=save+exit)[/dim]"
+            )
+        else:
+            label.update(
+                f" {base}  [bold yellow]EDIT[/bold yellow]  "
+                "[dim](Escape=save+exit)[/dim]"
+            )
 
     def exit_edit_mode(self) -> None:
         ta = self.query_one("#ep-area", TextArea)
         ta.read_only = True
         label = self.query_one("#ep-label", Label)
-        label.update(f" {os.path.basename(self._current_path)}  [dim](read-only · i=edit)[/dim]")
+        base = os.path.basename(self._current_path)
+        if self._audio_mode:
+            label.update(
+                f" {base}  [dim]audio · i=edit notes · p=play · e=close[/dim]"
+            )
+        else:
+            label.update(f" {base}  [dim](read-only · i=edit)[/dim]")
         self.save()
 
     def save(self) -> bool:
         if not self._current_path:
             return False
         ta = self.query_one("#ep-area", TextArea)
+        target = _audio_annotation_path(self._current_path) if self._audio_mode else self._current_path
         try:
-            Path(self._current_path).write_text(ta.text)
+            Path(target).write_text(ta.text, encoding="utf-8")
             return True
         except Exception:
             return False
+
+    def try_play_audio(self) -> bool:
+        """If the current file is audio, spawn a system player. Returns True if handled."""
+        if not self._audio_mode or not self._current_path:
+            return False
+        path = self._current_path
+        try:
+            if sys.platform == "darwin":
+                subprocess.Popen(
+                    ["afplay", path],
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    start_new_session=True,
+                )
+            else:
+                last_err: Exception | None = None
+                for cmd in (
+                    ["ffplay", "-nodisp", "-autoexit", "-loglevel", "quiet", path],
+                    ["mpv", "--no-video", path],
+                ):
+                    try:
+                        subprocess.Popen(
+                            cmd,
+                            stdout=subprocess.DEVNULL,
+                            stderr=subprocess.DEVNULL,
+                            start_new_session=True,
+                        )
+                        break
+                    except FileNotFoundError as e:
+                        last_err = e
+                else:
+                    raise FileNotFoundError from last_err
+        except FileNotFoundError:
+            self.app.notify(
+                "No player found (install ffmpeg/ffplay or mpv; macOS has afplay).",
+                title="Audio",
+                timeout=4,
+            )
+            return True
+        except Exception as e:
+            self.app.notify(f"Could not play: {e}", title="Audio", timeout=4)
+            return True
+        self.app.notify(f"Playing {os.path.basename(path)}", title="Audio", timeout=2)
+        return True
 
     @property
     def is_in_edit_mode(self) -> bool:
@@ -1010,6 +1180,10 @@ class EditorPanel(Static):
     @property
     def current_path(self) -> str:
         return self._current_path
+
+    @property
+    def is_audio_mode(self) -> bool:
+        return self._audio_mode
 
 
 # ---------------------------------------------------------------------------
@@ -1505,12 +1679,10 @@ class StatusBar(Static):
     .sb-project { color: $text-muted; padding: 0 2; width: 1fr; }
     .sb-agent   { padding: 0 2; }
     .sb-perm    { padding: 0 2; text-align: right; }
-    .sb-hint    { color: $text-muted; padding: 0 1; }
     """
 
     def compose(self) -> ComposeResult:
         yield Label("", id="sb-project", classes="sb-project")
-        yield Label("", id="sb-hint",    classes="sb-hint")
         yield Label("", id="sb-agent",   classes="sb-agent")
         yield Label("", id="sb-perm",    classes="sb-perm")
 
@@ -1519,16 +1691,47 @@ class StatusBar(Static):
 
     def update_agent(self, agent_type: str) -> None:
         label, color = _AGENT_LABELS.get(agent_type, ("?", "$text"))
-        self.query_one("#sb-agent", Label).update(f"[{color}]{label}[/{color}]  A=cycle")
+        self.query_one("#sb-agent", Label).update(f"[{color}]● {label}[/{color}]")
 
     def update_perm(self, mode: str) -> None:
         label, color = _PERM_LABELS.get(mode, ("?", "$text"))
-        self.query_one("#sb-perm",  Label).update(
-            f"[{color}]{label}[/{color}]  P=cycle"
-        )
-        self.query_one("#sb-hint",  Label).update(
-            "1-4=suggestion  o=open  n=agent"
-        )
+        self.query_one("#sb-perm", Label).update(f"[{color}]{label}[/{color}]")
+
+
+class ShortcutsBar(Static):
+    """Bottom bar showing key bindings at a glance."""
+
+    DEFAULT_CSS = """
+    ShortcutsBar {
+        height: 1;
+        background: $primary-darken-3;
+        layout: horizontal;
+        padding: 0 1;
+    }
+    .sc-key  { color: $accent; }
+    .sc-sep  { color: $text-muted; padding: 0 1; }
+    .sc-rest { color: $text-muted; width: 1fr; }
+    """
+
+    _SHORTCUTS = [
+        ("n/↵",  "new agent"),
+        ("⇧A",   "cycle agent"),
+        ("⇧P",   "permissions"),
+        ("] [",  "projects"),
+        ("f",    "files"),
+        ("e",    "editor"),
+        ("m",    "graph"),
+        ("t",    "terminal"),
+        ("o",    "open"),
+        ("x",    "cancel"),
+        ("q",    "quit"),
+    ]
+
+    def compose(self) -> ComposeResult:
+        parts = []
+        for key, desc in self._SHORTCUTS:
+            parts.append(f"[bold]{key}[/bold] {desc}")
+        yield Label("  ·  ".join(parts), classes="sc-rest")
 
 
 # ---------------------------------------------------------------------------
@@ -1622,7 +1825,7 @@ class VibeCLIApp(App[None]):
                 yield TerminalPanel(id="terminal-panel")
             yield GraphPane(self._vault, id="graph-pane")
         yield PromptBar(id="prompt-bar")
-        yield Footer()
+        yield ShortcutsBar(id="shortcuts-bar")
 
     async def on_mount(self) -> None:
         # Start the PreToolUse HTTP hook server (used in safe permission mode)
@@ -1670,7 +1873,7 @@ class VibeCLIApp(App[None]):
             suffix = f"  · {restored_count} agent(s) restored" if restored_count else ""
             self.notify(
                 f"{self._pm.active.name} — [bold]n[/bold]=new agent  "
-                f"[bold]o[/bold]=open project  [bold]P[/bold]=permissions{suffix}",
+                f"[bold]⇧A[/bold]=cycle agent  [bold]o[/bold]=open project  [bold]⇧P[/bold]=permissions{suffix}",
                 timeout=5,
             )
 
@@ -1718,6 +1921,13 @@ class VibeCLIApp(App[None]):
         if in_input or in_edit:
             return
 
+        # ── p: play audio when editor is open on an audio file ─────────────
+        if char == "p" and self._show_editor:
+            ep = self.query_one("#editor-panel", EditorPanel)
+            if ep.try_play_audio():
+                event.stop()
+                return
+
         # ── 1–4: fill suggestion into prompt ──────────────────────────────
         if key in "1234":
             pb = self.query_one("#prompt-bar", PromptBar)
@@ -1725,7 +1935,7 @@ class VibeCLIApp(App[None]):
             event.stop()
             return
 
-        # ── A (shift+a): cycle agent type ─────────────────────────────────
+        # ── A (shift+a): cycle agent type (Claude → Codex → Cursor) ────────
         if char == "A":
             self._cycle_agent_type()
             event.stop()
@@ -1982,7 +2192,7 @@ class VibeCLIApp(App[None]):
             self.action_open_project()
             return
 
-        # ── Normal: launch Claude agent ───────────────────────────────────
+        # ── Normal: launch agent ──────────────────────────────────────────
         self._sugg.record(active.name, prompt)
         self._pers.save()
 

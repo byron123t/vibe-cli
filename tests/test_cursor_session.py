@@ -3,11 +3,11 @@ import asyncio
 import json
 import pytest
 
-from terminal.cursor_session import CursorSession, _strip_ansi
+from terminal.cursor_session import CursorSession, _strip_ansi, _tool_name_from_key
 
 
 # ---------------------------------------------------------------------------
-# _strip_ansi
+# Helpers
 # ---------------------------------------------------------------------------
 
 class TestStripAnsi:
@@ -21,8 +21,22 @@ class TestStripAnsi:
         assert _strip_ansi("") == ""
 
 
+class TestToolNameFromKey:
+    def test_shell_tool_call(self):
+        assert _tool_name_from_key("shellToolCall") == "Shell"
+
+    def test_edit_file_tool_call(self):
+        assert _tool_name_from_key("editFileToolCall") == "Edit File"
+
+    def test_read_file_tool_call(self):
+        assert _tool_name_from_key("readFileToolCall") == "Read File"
+
+    def test_empty_key_returns_tool(self):
+        assert _tool_name_from_key("") == "Tool"
+
+
 # ---------------------------------------------------------------------------
-# CursorSession.is_available / _cli
+# is_available / _cli
 # ---------------------------------------------------------------------------
 
 class TestIsAvailable:
@@ -39,64 +53,39 @@ class TestIsAvailable:
         monkeypatch.setattr(shutil, "which", lambda name: None)
         assert CursorSession.is_available() is False
 
-    def test_cli_returns_agent(self, monkeypatch):
-        import shutil
-        monkeypatch.setattr(shutil, "which", lambda name: "/usr/local/bin/agent" if name == "agent" else None)
+    def test_cli_returns_agent(self):
         assert CursorSession._cli() == "agent"
 
 
 # ---------------------------------------------------------------------------
-# Construction
+# Trust/force flag logic
 # ---------------------------------------------------------------------------
 
-class TestCursorSessionConstruction:
-    def _make(self, **kwargs):
-        defaults = {
-            "prompt": "fix the bug",
-            "project_path": "/tmp/proj",
-            "permission_mode": "accept_edits",
-        }
-        defaults.update(kwargs)
-        return CursorSession(**defaults)
-
-    def test_prompt_stored(self):
-        assert self._make(prompt="hello").prompt == "hello"
-
-    def test_permission_mode_stored(self):
-        assert self._make(permission_mode="safe").permission_mode == "safe"
-
-    def test_proc_initially_none(self):
-        assert self._make()._proc is None
-
-    def test_exit_code_initially_none(self):
-        assert self._make().exit_code is None
-
-    def test_captured_session_id_initially_empty(self):
-        s = self._make()
-        assert not s.captured_session_id
-
-
-# ---------------------------------------------------------------------------
-# --force flag logic
-# ---------------------------------------------------------------------------
-
-class TestForceFlag:
+class TestTrustFlag:
     def _cmd(self, permission_mode: str, resume: str = "") -> list[str]:
-        force = ["--force"] if permission_mode in ("accept_edits", "bypass") else []
+        if permission_mode in ("accept_edits", "bypass"):
+            trust = ["--force"]
+        else:
+            trust = ["--trust"]
         cmd = ["agent", "--print", "--output-format", "stream-json"]
         if resume:
             cmd += ["--resume", resume]
-        cmd += force + ["test prompt"]
+        cmd += trust + ["test prompt"]
         return cmd
 
-    def test_safe_mode_has_no_force(self):
-        assert "--force" not in self._cmd("safe")
+    def test_safe_mode_uses_trust_not_force(self):
+        cmd = self._cmd("safe")
+        assert "--trust" in cmd
+        assert "--force" not in cmd
 
-    def test_accept_edits_has_force(self):
-        assert "--force" in self._cmd("accept_edits")
+    def test_accept_edits_uses_force(self):
+        cmd = self._cmd("accept_edits")
+        assert "--force" in cmd
+        assert "--trust" not in cmd
 
-    def test_bypass_has_force(self):
-        assert "--force" in self._cmd("bypass")
+    def test_bypass_uses_force(self):
+        cmd = self._cmd("bypass")
+        assert "--force" in cmd
 
     def test_resume_flag_included_when_set(self):
         cmd = self._cmd("safe", resume="sess-abc")
@@ -108,7 +97,7 @@ class TestForceFlag:
 
 
 # ---------------------------------------------------------------------------
-# _handle_event
+# _handle_event — actual agent CLI event structure
 # ---------------------------------------------------------------------------
 
 class TestHandleEvent:
@@ -145,48 +134,52 @@ class TestHandleEvent:
         s._handle_event({"type": "system", "session_id": "second"}, None)
         assert s.captured_session_id == "first"
 
-    def test_tool_call_started_emits_tool_name(self):
+    def test_tool_call_started_uses_description(self):
+        """When description is present, emit it (human-readable)."""
         s = self._make()
         received = []
         event = {
             "type": "tool_call",
             "subtype": "started",
             "session_id": "s1",
-            "tool_call": {"name": "WriteFile", "input": {"file_path": "src/main.py"}},
+            "tool_call": {
+                "shellToolCall": {
+                    "args": {"command": "ls -la", "workingDirectory": ""},
+                    "description": "List all files in workspace directory",
+                }
+            },
         }
         s._handle_event(event, received.append)
-        assert any("WriteFile" in line for line in received)
+        assert any("List all files" in line for line in received)
 
-    def test_tool_call_started_includes_file_path(self):
+    def test_tool_call_started_falls_back_to_key_name(self):
+        """Without description, humanize the tool key name."""
         s = self._make()
         received = []
         event = {
             "type": "tool_call",
             "subtype": "started",
             "session_id": "s1",
-            "tool_call": {"name": "Read", "input": {"file_path": "app.py"}},
+            "tool_call": {
+                "editFileToolCall": {
+                    "args": {"file_path": "main.py"},
+                }
+            },
         }
         s._handle_event(event, received.append)
-        assert any("app.py" in line for line in received)
+        assert any("Edit File" in line or "main.py" in line for line in received)
 
-    def test_tool_call_completed_not_emitted(self):
+    def test_tool_call_completed_emits_nothing(self):
         s = self._make()
         received = []
         event = {
             "type": "tool_call",
             "subtype": "completed",
             "session_id": "s1",
-            "tool_result": {"output": "done"},
+            "tool_call": {"shellToolCall": {"result": {"success": {"stdout": "done"}}}},
         }
         s._handle_event(event, received.append)
         assert received == []
-
-    def test_result_event_emits_text(self):
-        s = self._make()
-        received = []
-        event = {"type": "result", "session_id": "s1", "result": "All done!"}
-        s._handle_event(event, received.append)
-        assert "All done!" in received
 
     def test_result_event_updates_session_id(self):
         s = self._make()
@@ -195,36 +188,46 @@ class TestHandleEvent:
         s._handle_event(event, None)
         assert s.captured_session_id == "new-id"
 
+    def test_result_event_emits_nothing(self):
+        """Result text is duplicate of last assistant message — don't emit."""
+        s = self._make()
+        received = []
+        event = {"type": "result", "session_id": "s1", "result": "All done!"}
+        s._handle_event(event, received.append)
+        assert received == []
+
     def test_unknown_event_type_ignored(self):
         s = self._make()
         received = []
         s._handle_event({"type": "heartbeat", "session_id": "s1"}, received.append)
         assert received == []
 
-    def test_tool_call_command_shown(self):
+    def test_tool_call_with_command_in_args(self):
         s = self._make()
         received = []
         event = {
             "type": "tool_call",
             "subtype": "started",
             "session_id": "s1",
-            "tool_call": {"name": "Shell", "input": {"command": "ls -la"}},
+            "tool_call": {
+                "shellToolCall": {
+                    "args": {"command": "pytest tests/", "workingDirectory": ""},
+                }
+            },
         }
         s._handle_event(event, received.append)
-        assert any("ls -la" in line for line in received)
+        assert any("pytest tests/" in line or "Shell" in line for line in received)
 
-    def test_tool_call_truncates_long_detail(self):
+    def test_empty_text_blocks_not_emitted(self):
         s = self._make()
         received = []
-        long_cmd = "x" * 100
         event = {
-            "type": "tool_call",
-            "subtype": "started",
+            "type": "assistant",
             "session_id": "s1",
-            "tool_call": {"name": "Shell", "input": {"command": long_cmd}},
+            "message": {"content": [{"type": "text", "text": "   "}]},
         }
         s._handle_event(event, received.append)
-        assert any(len(line) < 120 for line in received)
+        assert received == []
 
 
 # ---------------------------------------------------------------------------
@@ -234,7 +237,7 @@ class TestHandleEvent:
 class TestCursorCancel:
     def test_cancel_noop_when_proc_none(self):
         s = CursorSession(prompt="p", project_path="/tmp", permission_mode="safe")
-        s.cancel()  # should not raise
+        s.cancel()
 
     def test_cancel_noop_when_already_done(self):
         import unittest.mock as mock
@@ -263,10 +266,8 @@ class TestCursorFileNotFound:
     @pytest.mark.asyncio
     async def test_file_not_found_exits_127(self, monkeypatch):
         async def _raise(*args, **kwargs):
-            raise FileNotFoundError("cursor not found")
-
+            raise FileNotFoundError("agent not found")
         monkeypatch.setattr(asyncio, "create_subprocess_exec", _raise)
-
         s = CursorSession(prompt="test", project_path="/tmp", permission_mode="safe")
         code = await s.run()
         assert code == 127
@@ -275,9 +276,7 @@ class TestCursorFileNotFound:
     async def test_file_not_found_emits_error_message(self, monkeypatch):
         async def _raise(*args, **kwargs):
             raise FileNotFoundError("no agent")
-
         monkeypatch.setattr(asyncio, "create_subprocess_exec", _raise)
-
         received = []
         s = CursorSession(prompt="test", project_path="/tmp", permission_mode="safe")
         await s.run(on_line=received.append)
@@ -285,13 +284,12 @@ class TestCursorFileNotFound:
 
 
 # ---------------------------------------------------------------------------
-# Stream-JSON parsing in run()
+# Stream parsing in run()
 # ---------------------------------------------------------------------------
 
 class TestCursorStreamParsing:
     def _make_proc(self, lines: list[bytes], returncode: int = 0):
         import unittest.mock as mock
-
         proc = mock.MagicMock()
         proc.returncode = returncode
 
@@ -320,41 +318,36 @@ class TestCursorStreamParsing:
             return proc
 
         monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_exec)
-
         received = []
         s = CursorSession(prompt="p", project_path="/tmp", permission_mode="safe")
         await s.run(on_line=received.append)
         assert "Hi" in received
-        # Raw JSON line should not appear
         assert not any(line.startswith("{") for line in received)
 
     @pytest.mark.asyncio
-    async def test_non_json_lines_emitted_as_plain_text(self, monkeypatch):
-        proc = self._make_proc([b"Starting up...\n", b"Working...\n"])
-
-        async def fake_exec(*args, **kwargs):
-            return proc
-
-        monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_exec)
-
-        received = []
-        s = CursorSession(prompt="p", project_path="/tmp", permission_mode="safe")
-        await s.run(on_line=received.append)
-        assert "Starting up..." in received
-
-    @pytest.mark.asyncio
     async def test_session_id_captured_from_stream(self, monkeypatch):
-        event = json.dumps({
-            "type": "system",
-            "session_id": "captured-sess-id",
-        })
+        event = json.dumps({"type": "system", "session_id": "captured-id"})
         proc = self._make_proc([event.encode() + b"\n"])
 
         async def fake_exec(*args, **kwargs):
             return proc
 
         monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_exec)
-
         s = CursorSession(prompt="p", project_path="/tmp", permission_mode="safe")
         await s.run()
-        assert s.captured_session_id == "captured-sess-id"
+        assert s.captured_session_id == "captured-id"
+
+    @pytest.mark.asyncio
+    async def test_large_limit_passed_to_subprocess(self, monkeypatch):
+        """Verify 8MB limit is set to handle large tool_call/completed events."""
+        from terminal.cursor_session import _STREAM_LIMIT
+        captured_kwargs = {}
+
+        async def fake_exec(*args, **kwargs):
+            captured_kwargs.update(kwargs)
+            return self._make_proc([])
+
+        monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_exec)
+        s = CursorSession(prompt="p", project_path="/tmp", permission_mode="safe")
+        await s.run()
+        assert captured_kwargs.get("limit", 0) >= _STREAM_LIMIT

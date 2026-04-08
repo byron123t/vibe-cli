@@ -190,7 +190,6 @@ async def test_permission_cycles_through_all_modes():
 
 
 async def test_capital_A_cycles_agent_type():
-    # A (shift+a) is handled via on_key char == "A"
     from ui.app import VibeCLIApp
     async with VibeCLIApp(_config()).run_test() as pilot:
         app = pilot.app
@@ -200,6 +199,29 @@ async def test_capital_A_cycles_agent_type():
         await pilot.press("A")
         await pilot.pause()
         assert app._agent_type != initial_type
+
+
+async def test_A_cycles_through_all_agents():
+    from ui.app import VibeCLIApp
+    async with VibeCLIApp(_config()).run_test() as pilot:
+        app = pilot.app
+        pilot.app.query_one("#agent-panel").focus()
+        await pilot.pause()
+        start = app._agent_type
+        seen = {start}
+        for _ in range(3):
+            await pilot.press("A")
+            await pilot.pause()
+            seen.add(app._agent_type)
+        assert app._agent_type == start
+        assert len(seen) >= 2
+
+
+async def test_shortcuts_bar_rendered():
+    from ui.app import VibeCLIApp, ShortcutsBar
+    async with VibeCLIApp(_config()).run_test() as pilot:
+        sb = pilot.app.query_one("#shortcuts-bar", ShortcutsBar)
+        assert sb is not None
 
 
 # ---------------------------------------------------------------------------
@@ -346,3 +368,35 @@ async def test_prompt_bar_suggestions_updated():
         # Setting suggestions should not raise
         pb.suggestions = ["Fix tests", "Commit changes"]
         await pilot.pause()
+
+
+# ---------------------------------------------------------------------------
+# Audio annotator (editor)
+# ---------------------------------------------------------------------------
+
+async def test_editor_audio_mode_uses_sidecar_notes():
+    from ui.app import VibeCLIApp, EditorPanel, _audio_annotation_path
+    from textual.widgets import TextArea
+    import os
+
+    with tempfile.TemporaryDirectory() as d:
+        audio = os.path.join(d, "clip.wav")
+        with open(audio, "wb") as f:
+            f.write(b"RIFF")
+        app = VibeCLIApp(_config())
+        app._pm.add_project(d)
+        async with app.run_test() as pilot:
+            ep = pilot.app.query_one("#editor-panel", EditorPanel)
+            ep.load_file(audio)
+            assert ep.is_audio_mode is True
+            meta = pilot.app.query_one("#ep-audio-meta")
+            assert meta.display is True
+            ta = pilot.app.query_one("#ep-area", TextArea)
+            assert "Audio notes" in ta.text or "#" in ta.text
+            ep.enter_edit_mode()
+            ta.text = "0:00 — intro\n"
+            ep.exit_edit_mode()
+        sidecar = _audio_annotation_path(audio)
+        assert os.path.isfile(sidecar)
+        with open(sidecar, encoding="utf-8") as f:
+            assert "intro" in f.read()
