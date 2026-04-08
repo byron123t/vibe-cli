@@ -4,15 +4,22 @@ Codex CLI reference: https://github.com/openai/codex
 Install: npm install -g @openai/codex
 
 Key flags used:
-  -q / --quiet          Non-interactive mode (no spinner/REPL)
-  --approval-mode       suggest | auto-edit | full-auto
-    suggest    — read files freely, asks before writes/shell commands
-    auto-edit  — reads + applies file edits, asks before shell commands
-    full-auto  — reads, writes, and runs shell commands without asking
+  exec                  Non-interactive subcommand
+  --json                Emit JSONL events to stdout
+  --sandbox             read-only | workspace-write | danger-full-access
+  --full-auto           Convenience alias: workspace-write sandbox + auto approvals
+  --dangerously-bypass-approvals-and-sandbox
+                        No confirmations, no sandboxing (bypass mode)
+
+Permission mode mapping:
+  safe         → --sandbox read-only
+  accept_edits → --full-auto  (workspace-write + auto approve)
+  bypass       → --dangerously-bypass-approvals-and-sandbox
 """
 from __future__ import annotations
 
 import asyncio
+import json as _json
 import re
 import shutil
 from typing import Callable
@@ -24,21 +31,21 @@ def _strip_ansi(text: str) -> str:
     return re.sub(r"\x1b\[[0-9;]*[mKHFABCDJG]", "", text)
 
 
-# Maps VibeCLI permission modes → codex --approval-mode values
-_APPROVAL: dict[str, list[str]] = {
-    "safe":         ["--approval-mode", "suggest"],
-    "accept_edits": ["--approval-mode", "auto-edit"],
-    "bypass":       ["--approval-mode", "full-auto"],
+# Maps VibeCLI permission modes → codex exec flags
+_PERMISSION_FLAGS: dict[str, list[str]] = {
+    "safe":         ["--sandbox", "read-only"],
+    "accept_edits": ["--full-auto"],
+    "bypass":       ["--dangerously-bypass-approvals-and-sandbox"],
 }
 
 
 class CodexSession(AgentSession):
     """
-    Wraps: codex -q --approval-mode <mode> "<prompt>"
+    Wraps: codex exec --json [permission flags] "<prompt>"
 
-    Codex streams plain-text output to stdout.  No structured JSON output
-    is available, so each non-empty line is displayed as-is after stripping
-    ANSI escape codes.
+    With --json, codex emits JSONL events.  We extract message text from
+    assistant events and display tool activity lines.  Plain non-JSON lines
+    are shown after ANSI stripping.
 
     Session resumption is not supported by the Codex CLI; each run is
     independent.  The `resume_session_id` parameter is accepted but ignored.
@@ -52,13 +59,17 @@ class CodexSession(AgentSession):
     def is_available() -> bool:
         return shutil.which("codex") is not None
 
+    @staticmethod
+    def _cli() -> str:
+        return "codex"
+
     async def run(
         self,
         on_line: Callable[[str], None] | None = None,
         on_permission_request: Callable[[dict], None] | None = None,
     ) -> int:
-        approval_flags = _APPROVAL.get(self.permission_mode, _APPROVAL["accept_edits"])
-        cmd = ["codex", "-q"] + approval_flags + self.extra_flags + [self.prompt]
+        perm_flags = _PERMISSION_FLAGS.get(self.permission_mode, _PERMISSION_FLAGS["accept_edits"])
+        cmd = ["codex", "exec", "--json"] + perm_flags + self.extra_flags + [self.prompt]
 
         try:
             self._proc = await asyncio.create_subprocess_exec(
@@ -69,9 +80,19 @@ class CodexSession(AgentSession):
             )
             assert self._proc.stdout is not None
             async for raw_line in self._proc.stdout:
-                line = _strip_ansi(raw_line.decode(errors="replace").rstrip())
-                if line:
-                    self._emit(line, on_line)
+                line = raw_line.decode(errors="replace").rstrip()
+                if not line:
+                    continue
+                if line.startswith("{"):
+                    try:
+                        event = _json.loads(line)
+                        self._handle_event(event, on_line)
+                        continue
+                    except _json.JSONDecodeError:
+                        pass
+                cleaned = _strip_ansi(line)
+                if cleaned:
+                    self._emit(cleaned, on_line)
             await self._proc.wait()
             self.exit_code = self._proc.returncode
         except FileNotFoundError:
@@ -84,6 +105,51 @@ class CodexSession(AgentSession):
             self._emit(f"[!] Codex session error: {e}", on_line)
             self.exit_code = 1
         return self.exit_code or 0
+
+    def _handle_event(self, event: dict, on_line: Callable[[str], None] | None) -> None:
+        """Parse a codex --json event and emit display text.
+
+        Observed event shapes:
+          {"type":"thread.started","thread_id":"..."}
+          {"type":"turn.started"}
+          {"type":"item.completed","item":{"type":"agent_message","text":"..."}}
+          {"type":"item.started","item":{"type":"command_execution","command":"...",...}}
+          {"type":"item.completed","item":{"type":"command_execution","command":"...","aggregated_output":"...","exit_code":0}}
+          {"type":"turn.completed","usage":{...}}
+        """
+        etype = event.get("type", "")
+
+        # Capture thread/session id
+        if not self.captured_session_id:
+            sid = event.get("thread_id") or event.get("session_id")
+            if sid and isinstance(sid, str):
+                self.captured_session_id = sid
+
+        # item.completed — agent messages and finished tool runs
+        if etype == "item.completed":
+            item = event.get("item") or {}
+            itype = item.get("type", "")
+            if itype == "agent_message":
+                text = item.get("text", "").strip()
+                if text:
+                    self._emit(text, on_line)
+            elif itype == "command_execution":
+                output = item.get("aggregated_output", "").strip()
+                if output:
+                    for line in output.splitlines():
+                        stripped = line.strip()
+                        if stripped:
+                            self._emit(stripped, on_line)
+            return
+
+        # item.started — show tool activity indicator
+        if etype == "item.started":
+            item = event.get("item") or {}
+            itype = item.get("type", "")
+            if itype == "command_execution":
+                cmd = item.get("command", "")[:60]
+                self._emit(f"⟳ {cmd}" if cmd else "⟳ running command…", on_line)
+            return
 
     def cancel(self) -> None:
         if self._proc and self._proc.returncode is None:
