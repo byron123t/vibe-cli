@@ -367,6 +367,9 @@ class AgentWidget(Static):
         min-height: 7;
         max-height: 36;
     }
+    AgentWidget.agent-selected {
+        border: solid $accent;
+    }
     .agent-header {
         background: $surface;
         color: $text-muted;
@@ -653,9 +656,10 @@ class AgentPanel(Static, can_focus=True):
         super().__init__(**kwargs)
         self._active_project: str = ""
         self._project_counts: dict[str, int] = {}
+        self._selected_idx: dict[str, int] = {}  # project → selected agent index (-1 = none)
 
     def compose(self) -> ComposeResult:
-        yield Label(" AGENTS  [dim](n = new prompt · x = cancel · d = close · j/k = scroll)[/dim]",
+        yield Label(" AGENTS  [dim](n = new prompt · x = cancel · d = detach  r = reattach · j/k = scroll)[/dim]",
                     classes="ap-header")
         # Per-project ScrollableContainers are created lazily in switch_project()
 
@@ -716,6 +720,74 @@ class AgentPanel(Static, can_focus=True):
         container.scroll_end(animate=False)
         self._update_hint()
         return widget
+
+    def _get_selected_idx(self) -> int:
+        return self._selected_idx.get(self._active_project, -1)
+
+    def _set_selected_idx(self, idx: int) -> None:
+        agents = self.active_agents()
+        if not agents:
+            self._selected_idx[self._active_project] = -1
+            return
+        idx = max(0, min(idx, len(agents) - 1))
+        self._selected_idx[self._active_project] = idx
+        # Update highlight CSS class
+        for i, w in enumerate(agents):
+            if i == idx:
+                w.add_class("agent-selected")
+            else:
+                w.remove_class("agent-selected")
+        # Scroll selected widget into view
+        agents[idx].scroll_visible()
+
+    def selected_agent(self) -> "AgentWidget | None":
+        agents = self.active_agents()
+        if not agents:
+            return None
+        idx = self._get_selected_idx()
+        if idx < 0:
+            return agents[-1]  # default to last
+        return agents[min(idx, len(agents) - 1)]
+
+    def select_next(self) -> None:
+        agents = self.active_agents()
+        if not agents:
+            return
+        idx = self._get_selected_idx()
+        self._set_selected_idx(idx + 1 if idx >= 0 else len(agents) - 1)
+
+    def select_prev(self) -> None:
+        agents = self.active_agents()
+        if not agents:
+            return
+        idx = self._get_selected_idx()
+        if idx <= 0:
+            idx = 0
+        else:
+            idx -= 1
+        self._set_selected_idx(idx)
+
+    def detach_selected(self) -> "dict | None":
+        """Remove the selected AgentWidget and return its saved state dict."""
+        w = self.selected_agent()
+        if w is None:
+            return None
+        state = w.to_state()
+        state["agent_type"] = w._agent_type
+        # Update selection
+        agents = self.active_agents()
+        idx = self._get_selected_idx()
+        w.remove()
+        remaining = self.active_agents()
+        if remaining:
+            new_idx = max(0, min(idx, len(remaining) - 1))
+            self._set_selected_idx(new_idx)
+        else:
+            self._selected_idx[self._active_project] = -1
+        prev = self._project_counts.get(self._active_project, 0)
+        self._project_counts[self._active_project] = max(0, prev - 1)
+        self._update_hint()
+        return state
 
     def remove_last(self) -> None:
         try:
@@ -789,16 +861,10 @@ class AgentPanel(Static, can_focus=True):
         self._update_hint()
 
     def scroll_down(self) -> None:
-        try:
-            self._active_container().scroll_down()
-        except Exception:
-            pass
+        self.select_next()
 
     def scroll_up(self) -> None:
-        try:
-            self._active_container().scroll_up()
-        except Exception:
-            pass
+        self.select_prev()
 
     @on(AgentWidget.Complete)
     def _bubble(self, event: AgentWidget.Complete) -> None:
@@ -1718,12 +1784,13 @@ class ShortcutsBar(Static):
         ("⇧A",   "cycle agent"),
         ("⇧P",   "permissions"),
         ("] [",  "projects"),
+        ("d",    "detach"),
+        ("r",    "reattach"),
+        ("⇧R",   "run cmd"),
         ("f",    "files"),
         ("e",    "editor"),
         ("m",    "graph"),
         ("t",    "terminal"),
-        ("o",    "open"),
-        ("x",    "cancel"),
         ("q",    "quit"),
     ]
 
@@ -1732,6 +1799,124 @@ class ShortcutsBar(Static):
         for key, desc in self._SHORTCUTS:
             parts.append(f"[bold]{key}[/bold] {desc}")
         yield Label("  ·  ".join(parts), classes="sc-rest")
+
+
+# ---------------------------------------------------------------------------
+# DetachMenuScreen — modal listing detached agents for reattachment
+# ---------------------------------------------------------------------------
+
+class DetachMenuScreen(ModalScreen):
+    """Modal listing detached agents — Enter to reattach, Delete to kill."""
+
+    DEFAULT_CSS = """
+    DetachMenuScreen {
+        align: center middle;
+    }
+    #detach-menu-container {
+        width: 72;
+        max-height: 24;
+        background: $surface;
+        border: solid $accent;
+        padding: 1 2;
+    }
+    .dm-title {
+        text-align: center;
+        color: $accent;
+        margin-bottom: 1;
+    }
+    .dm-item {
+        padding: 0 1;
+        color: $text;
+        width: 1fr;
+    }
+    .dm-item-focused {
+        background: $accent-darken-2;
+        color: $text;
+    }
+    .dm-empty {
+        color: $text-muted;
+        text-align: center;
+        padding: 1;
+    }
+    .dm-hint {
+        color: $text-muted;
+        text-align: center;
+        margin-top: 1;
+    }
+    """
+
+    def __init__(self, detached: list[dict]) -> None:
+        super().__init__()
+        self._detached = detached
+        self._cursor: int = 0
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="detach-menu-container"):
+            yield Label("─── Detached Agents ───", classes="dm-title")
+            if not self._detached:
+                yield Label("No detached agents for this project.", classes="dm-empty")
+            else:
+                for i, state in enumerate(self._detached):
+                    prompt = state.get("prompt", "")[:52]
+                    agent_type = state.get("agent_type", "claude")
+                    text = f"[{i+1}]  [{agent_type}]  {prompt}"
+                    classes = "dm-item dm-item-focused" if i == 0 else "dm-item"
+                    yield Label(text, id=f"dm-item-{i}", classes=classes)
+            yield Label("↑↓/j/k=navigate  ↵=reattach  Del=kill  Esc=cancel", classes="dm-hint")
+
+    def _move_cursor(self, delta: int) -> None:
+        if not self._detached:
+            return
+        old = self._cursor
+        self._cursor = (self._cursor + delta) % len(self._detached)
+        try:
+            self.query_one(f"#dm-item-{old}", Label).remove_class("dm-item-focused")
+            self.query_one(f"#dm-item-{self._cursor}", Label).add_class("dm-item-focused")
+        except Exception:
+            pass
+
+    def on_key(self, event) -> None:
+        key = event.key
+        char = event.character or ""
+
+        if key == "escape":
+            self.dismiss(None)
+            event.stop()
+            return
+
+        if key in ("down", "arrow_down", "j"):
+            self._move_cursor(1)
+            event.stop()
+            return
+
+        if key in ("up", "arrow_up", "k"):
+            self._move_cursor(-1)
+            event.stop()
+            return
+
+        if key == "enter" and self._detached:
+            self.dismiss(("reattach", self._cursor))
+            event.stop()
+            return
+
+        if key in ("delete", "backspace") and self._detached:
+            self.dismiss(("kill", self._cursor))
+            event.stop()
+            return
+
+        # 1-9: jump cursor to that item
+        if char.isdigit() and int(char) > 0:
+            idx = int(char) - 1
+            if idx < len(self._detached):
+                old = self._cursor
+                self._cursor = idx
+                try:
+                    self.query_one(f"#dm-item-{old}", Label).remove_class("dm-item-focused")
+                    self.query_one(f"#dm-item-{self._cursor}", Label).add_class("dm-item-focused")
+                except Exception:
+                    pass
+            event.stop()
+            return
 
 
 # ---------------------------------------------------------------------------
@@ -1756,7 +1941,7 @@ class VibeCLIApp(App[None]):
         Binding("enter", "focus_prompt",     "New Agent",  show=False),
         Binding("o",     "open_project",     "Open Project"),
         Binding("x",     "cancel_agent",     "Cancel"),
-        Binding("d",     "close_agent",      "Dismiss"),
+        Binding("d",     "detach_agent",     "Detach"),
         Binding("j",     "scroll_down",      "↓"),
         Binding("k",     "scroll_up",        "↑"),
         Binding("f",     "toggle_files",     "Files"),
@@ -1765,7 +1950,7 @@ class VibeCLIApp(App[None]):
         Binding("m",     "toggle_graph",     "Memory"),
         Binding("t",     "toggle_terminal",  "Terminal"),
         Binding("ctrl+t","toggle_terminal",  "Terminal", show=False),
-        Binding("r",     "run_last_command", "Run Cmd"),
+        Binding("r",     "reattach_menu",    "Reattach"),
         Binding("s",     "save_file",        "Save"),
         Binding("escape","exit_mode",        "Back", show=False),
         Binding("q",     "quit",             "Quit"),
@@ -1811,6 +1996,7 @@ class VibeCLIApp(App[None]):
         self._show_graph    = False
         self._show_terminal = False
         self._last_command: str = ""
+        self._detached: dict[str, list[dict]] = {}  # project_path → list of detached agent states
 
     # ------------------------------------------------------------------ compose
 
@@ -1941,6 +2127,12 @@ class VibeCLIApp(App[None]):
             event.stop()
             return
 
+        # ── R (shift+r): run last detected shell command ──────────────────
+        if char == "R":
+            self.action_run_last_command()
+            event.stop()
+            return
+
         # ── P (shift+p): cycle permission mode ────────────────────────────
         if char == "P":
             self._cycle_permissions()
@@ -2038,8 +2230,43 @@ class VibeCLIApp(App[None]):
     def action_cancel_agent(self) -> None:
         self.query_one("#agent-panel", AgentPanel).cancel_last()
 
-    def action_close_agent(self) -> None:
-        self.query_one("#agent-panel", AgentPanel).remove_last()
+    def action_detach_agent(self) -> None:
+        active = self._pm.active
+        if active is None:
+            return
+        panel = self.query_one("#agent-panel", AgentPanel)
+        state = panel.detach_selected()
+        if state is None:
+            self.notify("No agent to detach.", timeout=2)
+            return
+        bucket = self._detached.setdefault(active.path, [])
+        bucket.append(state)
+        prompt = state.get("prompt", "")[:40]
+        self.notify(f"Detached: {prompt}…  (r=reattach)", timeout=3)
+
+    def action_reattach_menu(self) -> None:
+        active = self._pm.active
+        if active is None:
+            return
+        detached = self._detached.get(active.path, [])
+
+        def _on_result(result):
+            if result is None:
+                return
+            action, idx = result
+            detached_list = self._detached.get(active.path, [])
+            if idx >= len(detached_list):
+                return
+            if action == "kill":
+                detached_list.pop(idx)
+                self.notify("Agent killed.", timeout=2)
+            elif action == "reattach":
+                state = detached_list.pop(idx)
+                panel = self.query_one("#agent-panel", AgentPanel)
+                panel.restore_agents(active.name, [state], self._vault)
+                self.notify(f"Reattached: {state.get('prompt','')[:40]}…", timeout=3)
+
+        self.push_screen(DetachMenuScreen(list(detached)), _on_result)
 
     def action_scroll_down(self) -> None:
         self.query_one("#agent-panel", AgentPanel).scroll_down()
@@ -2657,6 +2884,7 @@ class VibeCLIApp(App[None]):
                 "show_graph":         self._show_graph,
             },
             "projects": projects_state,
+            "detached": self._detached,
         }
         try:
             SessionStore().save(state)
@@ -2680,6 +2908,9 @@ class VibeCLIApp(App[None]):
 
         self.query_one("#status-bar", StatusBar).update_agent(self._agent_type)
         self.query_one("#status-bar", StatusBar).update_perm(self._perm_mode)
+
+        # Restore detached agents
+        self._detached = state.get("detached", {})
 
         # Restore agents per project
         ap      = self.query_one("#agent-panel", AgentPanel)
