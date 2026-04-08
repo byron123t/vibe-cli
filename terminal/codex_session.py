@@ -32,11 +32,21 @@ def _strip_ansi(text: str) -> str:
 
 
 # Maps VibeCLI permission modes → codex exec flags
+# Codex has no native plan mode, so "plan" uses read-only sandbox and a
+# planning instruction is prepended to the prompt in run().
 _PERMISSION_FLAGS: dict[str, list[str]] = {
+    "plan":         ["--sandbox", "read-only"],
     "safe":         ["--sandbox", "read-only"],
     "accept_edits": ["--full-auto"],
     "bypass":       ["--dangerously-bypass-approvals-and-sandbox"],
 }
+
+_PLAN_PREFIX = (
+    "PLANNING MODE — Do NOT write any files or execute any shell commands. "
+    "Only analyse, reason, and describe your plan. "
+    "If you would normally make edits, describe exactly what changes you would make instead. "
+)
+
 
 
 class CodexSession(AgentSession):
@@ -69,7 +79,8 @@ class CodexSession(AgentSession):
         on_permission_request: Callable[[dict], None] | None = None,
     ) -> int:
         perm_flags = _PERMISSION_FLAGS.get(self.permission_mode, _PERMISSION_FLAGS["accept_edits"])
-        cmd = ["codex", "exec", "--json"] + perm_flags + self.extra_flags + [self.prompt]
+        prompt = (_PLAN_PREFIX + self.prompt) if self.permission_mode == "plan" else self.prompt
+        cmd = ["codex", "exec", "--json"] + perm_flags + self.extra_flags + [prompt]
 
         try:
             self._proc = await asyncio.create_subprocess_exec(

@@ -49,8 +49,9 @@ def _strip_ansi(text: str) -> str:
 #
 # "bypass" is the only mode that skips permissions entirely.
 PERMISSION_FLAGS: dict[str, list[str]] = {
+    "plan":         ["--permission-mode", "plan"],  # read-only / planning; no writes or exec
     "safe":         [],
-    "accept_edits": [],                          # hook handles approval, not the CLI flag
+    "accept_edits": [],                              # hook handles approval, not the CLI flag
     "bypass":       ["--dangerously-skip-permissions"],
 }
 

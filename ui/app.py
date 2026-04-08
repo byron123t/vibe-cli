@@ -76,6 +76,7 @@ from memory.run_log import RunLogger
 from memory.user_profile import UserProfile
 from memory.linter import VaultLinter
 from memory.linker import Linker
+from memory.brain_importer import BrainImporter
 
 
 # ---------------------------------------------------------------------------
@@ -1473,7 +1474,7 @@ class ProjectTabBar(Static):
     def _make_buttons(self):
         for i, p in enumerate(self._projects):
             cls = "tab active" if i == self._active else "tab"
-            yield Button(self._tab_label(i, p.name), id=f"ptab-{i}", classes=cls)
+            yield Button(self._tab_label(i, p.display_name), id=f"ptab-{i}", classes=cls)
         yield Button("⊕", id="ptab-add", classes="tab-add")
 
     # ── update ───────────────────────────────────────────────────────
@@ -1616,7 +1617,14 @@ class PromptBar(Static):
 # ---------------------------------------------------------------------------
 
 class DirectoryPickerScreen(ModalScreen):
-    """Modal overlay: navigate the filesystem and open a directory as a project."""
+    """Modal overlay: navigate the filesystem and open a directory as a project.
+
+    Tab bar at the top toggles between local filesystem picker and Remote SSH form.
+    Dismisses with:
+      str                         — local directory path
+      {"path": ..., "ssh_info": ...}  — SSH-mounted project
+      None                        — cancelled
+    """
 
     DEFAULT_CSS = """
     DirectoryPickerScreen {
@@ -1624,15 +1632,22 @@ class DirectoryPickerScreen(ModalScreen):
     }
     #dp-container {
         width: 72;
-        height: 32;
+        height: 40;
         border: thick $accent;
         background: $surface;
         padding: 1 2;
     }
-    #dp-header { height: 1; color: $text-muted; }
-    #dp-tree   { height: 1fr; border: solid $primary-darken-2; margin: 1 0; }
-    #dp-input  { height: 3; border: tall $accent; }
-    #dp-footer { height: 1; color: $text-muted; }
+    #dp-tabs    { height: 3; margin-bottom: 1; }
+    .dp-tab     { width: 16; background: $surface; color: $text-muted; }
+    .dp-tab-active { background: $accent-darken-2; color: $text; }
+    #dp-header  { height: 1; color: $text-muted; }
+    #dp-tree    { height: 1fr; border: solid $primary-darken-2; margin: 1 0; }
+    #dp-input   { height: 3; border: tall $accent; }
+    #dp-footer  { height: 1; color: $text-muted; }
+    #dp-ssh-pane { height: 1fr; }
+    .dp-ssh-label { color: $text-muted; margin-top: 1; height: 1; }
+    .dp-ssh-input { margin-bottom: 0; border: tall $primary-darken-2; }
+    #dp-ssh-hint  { color: $text-muted; margin-top: 1; }
     """
 
     BINDINGS = [
@@ -1642,72 +1657,217 @@ class DirectoryPickerScreen(ModalScreen):
 
     def __init__(self, start_path: str | None = None, **kwargs) -> None:
         super().__init__(**kwargs)
-        # Always root the tree at ~ so the user can navigate anywhere.
-        # start_path is shown in the input as a starting suggestion only.
         self._tree_root  = os.path.expanduser("~")
         self._input_init = start_path or self._tree_root
+        self._ssh_mode   = False   # False = local, True = SSH
 
     def compose(self) -> ComposeResult:
         with Container(id="dp-container"):
-            yield Label(
-                " OPEN PROJECT  [dim]↑↓ tree · Enter = open dir · type path to jump · Escape = cancel[/dim]",
-                id="dp-header",
-            )
-            yield DirectoryTree(self._tree_root, id="dp-tree")
-            yield Input(
-                value=self._input_init,
-                placeholder="type a path to jump the tree there…",
-                id="dp-input",
-            )
-            yield Label(
-                " Tab = focus tree · Enter in input = open · paths update tree as you type",
-                id="dp-footer",
-            )
+            with Horizontal(id="dp-tabs"):
+                yield Button("📁 Local",      id="dp-tab-local", classes="dp-tab dp-tab-active")
+                yield Button("🌐 Remote SSH", id="dp-tab-ssh",   classes="dp-tab")
+
+            # ── Local pane ────────────────────────────────────────────────
+            with Container(id="dp-local-pane"):
+                yield Label(
+                    " OPEN PROJECT  [dim]↑↓ tree · Enter = open · type path · Escape = cancel[/dim]",
+                    id="dp-header",
+                )
+                yield DirectoryTree(self._tree_root, id="dp-tree")
+                yield Input(
+                    value=self._input_init,
+                    placeholder="type a path to jump the tree there…",
+                    id="dp-input",
+                )
+                yield Label(
+                    " Tab = focus tree · Enter in input = open · paths update as you type",
+                    id="dp-footer",
+                )
+
+            # ── SSH pane (hidden by default) ──────────────────────────────
+            with Container(id="dp-ssh-pane"):
+                yield Label("Host (e.g. myserver.com or 192.168.1.1):", classes="dp-ssh-label")
+                yield Input(placeholder="hostname or IP", id="dp-ssh-host", classes="dp-ssh-input")
+                yield Label("Username (leave blank to use default):", classes="dp-ssh-label")
+                yield Input(placeholder="user", id="dp-ssh-user", classes="dp-ssh-input")
+                yield Label("Port (default 22):", classes="dp-ssh-label")
+                yield Input(placeholder="22", id="dp-ssh-port", classes="dp-ssh-input")
+                yield Label("Remote path:", classes="dp-ssh-label")
+                yield Input(placeholder="~/projects/myapp", id="dp-ssh-path", classes="dp-ssh-input")
+                yield Label(
+                    "↵ = mount & open  ·  requires sshfs  ·  Esc = cancel",
+                    id="dp-ssh-hint",
+                )
 
     def on_mount(self) -> None:
+        self.query_one("#dp-ssh-pane").display = False
         self.query_one("#dp-tree", DirectoryTree).focus()
 
-    # Track highlighted node → update the path input
+    # ── Tab switching ─────────────────────────────────────────────────────
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        bid = event.button.id
+        if bid == "dp-tab-local":
+            self._set_mode(ssh=False)
+        elif bid == "dp-tab-ssh":
+            self._set_mode(ssh=True)
+
+    def _set_mode(self, ssh: bool) -> None:
+        self._ssh_mode = ssh
+        self.query_one("#dp-local-pane").display = not ssh
+        self.query_one("#dp-ssh-pane").display   = ssh
+        self.query_one("#dp-tab-local").set_class(not ssh, "dp-tab-active")
+        self.query_one("#dp-tab-ssh").set_class(ssh,      "dp-tab-active")
+        if ssh:
+            self.query_one("#dp-ssh-host", Input).focus()
+        else:
+            self.query_one("#dp-tree", DirectoryTree).focus()
+
+    # ── Local tree handlers ───────────────────────────────────────────────
+
     @on(Tree.NodeHighlighted, "#dp-tree")
     def _node_highlighted(self, event: Tree.NodeHighlighted) -> None:
-        node = event.node
-        if node.data is not None:
-            self.query_one("#dp-input", Input).value = str(node.data)
+        data = event.node.data
+        if data is not None:
+            # node.data is a DirEntry(path=PosixPath(...)) — extract .path
+            path = getattr(data, "path", data)
+            self.query_one("#dp-input", Input).value = str(path)
 
-    # Live re-root the tree as the user types a valid directory path
     @on(Input.Changed, "#dp-input")
     def _input_changed(self, event: Input.Changed) -> None:
         path = os.path.expanduser(event.value.strip())
         if os.path.isdir(path):
-            tree = self.query_one("#dp-tree", DirectoryTree)
-            tree.path = Path(path)
+            self.query_one("#dp-tree", DirectoryTree).path = Path(path)
 
-    # Tab in input → focus tree
     def on_input_key(self, event: Key) -> None:
         if event.key == "tab":
-            self.query_one("#dp-tree", DirectoryTree).focus()
+            if self._ssh_mode:
+                # Tab through SSH fields handled elsewhere
+                return
+            # Tab in path input → try to complete the partial directory name
+            inp   = self.query_one("#dp-input", Input)
+            typed = os.path.expanduser(inp.value.strip())
+            completed = self._tab_complete(typed)
+            if completed and completed != typed:
+                inp.value  = completed
+                inp.cursor_position = len(completed)
+            else:
+                # Nothing to complete — focus tree instead
+                self.query_one("#dp-tree", DirectoryTree).focus()
             event.stop()
 
-    # File clicked → use its parent directory
+    @staticmethod
+    def _tab_complete(typed: str) -> str:
+        """Return the longest unambiguous completion for a partial path."""
+        if not typed:
+            return typed
+        # If typed is already an exact directory, append separator and return
+        if os.path.isdir(typed):
+            return typed.rstrip("/") + "/"
+        parent  = os.path.dirname(typed) or "/"
+        prefix  = os.path.basename(typed).lower()
+        if not os.path.isdir(parent):
+            return typed
+        try:
+            matches = sorted(
+                e for e in os.listdir(parent)
+                if e.lower().startswith(prefix)
+                and os.path.isdir(os.path.join(parent, e))
+            )
+        except PermissionError:
+            return typed
+        if not matches:
+            return typed
+        if len(matches) == 1:
+            return os.path.join(parent, matches[0]) + "/"
+        # Multiple matches — complete to longest common prefix
+        common = os.path.commonprefix(matches)
+        return os.path.join(parent, common) if common else typed
+
     @on(DirectoryTree.FileSelected, "#dp-tree")
     def _file_selected(self, event: DirectoryTree.FileSelected) -> None:
         self.dismiss(str(Path(str(event.path)).parent))
 
-    # Directory selected (Textual ≥0.52) → open it
     def on_directory_tree_directory_selected(self, event) -> None:
         try:
             self.dismiss(str(event.path))
         except AttributeError:
             pass
 
-    # Enter in path input
     @on(Input.Submitted, "#dp-input")
-    def _input_submitted(self, event: Input.Submitted) -> None:
+    def _local_submitted(self, event: Input.Submitted) -> None:
         path = os.path.expanduser(event.value.strip())
         if os.path.isdir(path):
             self.dismiss(path)
         else:
             self.notify(f"Not a directory: {path}", severity="error", timeout=3)
+
+    # ── SSH form submit ───────────────────────────────────────────────────
+
+    @on(Input.Submitted, "#dp-ssh-host")
+    @on(Input.Submitted, "#dp-ssh-user")
+    @on(Input.Submitted, "#dp-ssh-port")
+    @on(Input.Submitted, "#dp-ssh-path")
+    def _ssh_field_submitted(self, event: Input.Submitted) -> None:
+        """Tab through SSH fields; submit on the last one."""
+        order = ["dp-ssh-host", "dp-ssh-user", "dp-ssh-port", "dp-ssh-path"]
+        current = event.input.id
+        try:
+            next_id = order[order.index(current) + 1]
+            self.query_one(f"#{next_id}", Input).focus()
+        except IndexError:
+            # Last field — attempt mount
+            self._submit_ssh()
+        event.stop()
+
+    def _submit_ssh(self) -> None:
+        from core.ssh_mount import SSHInfo, mount as ssh_mount, is_available as sshfs_available
+
+        host = self.query_one("#dp-ssh-host", Input).value.strip()
+        if not host:
+            self.notify("Host is required.", severity="error", timeout=3)
+            self.query_one("#dp-ssh-host", Input).focus()
+            return
+
+        user      = self.query_one("#dp-ssh-user", Input).value.strip()
+        port_str  = self.query_one("#dp-ssh-port", Input).value.strip() or "22"
+        rpath     = self.query_one("#dp-ssh-path", Input).value.strip() or "~"
+
+        try:
+            port = int(port_str)
+        except ValueError:
+            self.notify("Port must be a number.", severity="error", timeout=3)
+            return
+
+        if not sshfs_available():
+            self.notify(
+                "sshfs not found. Install: brew install macfuse (macOS) or apt install sshfs (Linux)",
+                severity="error", timeout=6,
+            )
+            return
+
+        info = SSHInfo(host=host, user=user, port=port, remote_path=rpath)
+        self.notify(f"Mounting {info.display}…", timeout=4)
+
+        # Run sshfs in a thread so the TUI doesn't freeze
+        import threading
+
+        def _do_mount():
+            try:
+                local = ssh_mount(info, timeout=20)
+                self.app.call_from_thread(
+                    self.dismiss,
+                    {"path": local, "ssh_info": info.to_dict()},
+                )
+            except Exception as exc:
+                self.app.call_from_thread(
+                    self.notify,
+                    f"SSH mount failed: {exc}",
+                    severity="error",
+                    timeout=8,
+                )
+
+        threading.Thread(target=_do_mount, daemon=True).start()
 
     def action_cancel(self) -> None:
         self.dismiss(None)
@@ -1718,11 +1878,12 @@ class DirectoryPickerScreen(ModalScreen):
 # ---------------------------------------------------------------------------
 
 _PERM_LABELS = {
+    "plan":         ("PLAN 📋",        "$accent"),
     "safe":         ("SAFE",          "$success"),
     "accept_edits": ("ACCEPT EDITS",  "$warning"),
     "bypass":       ("BYPASS ALL ⚡", "$error"),
 }
-_PERM_CYCLE = ["safe", "accept_edits", "bypass"]
+_PERM_CYCLE = ["plan", "safe", "accept_edits", "bypass"]
 
 _AGENT_LABELS: dict[str, tuple[str, str]] = {
     "claude": ("Claude", "$accent"),
@@ -1780,25 +1941,89 @@ class ShortcutsBar(Static):
     """
 
     _SHORTCUTS = [
-        ("n/↵",  "new agent"),
-        ("⇧A",   "cycle agent"),
-        ("⇧P",   "permissions"),
-        ("] [",  "projects"),
-        ("d",    "detach"),
-        ("r",    "reattach"),
-        ("⇧R",   "run cmd"),
-        ("f",    "files"),
-        ("e",    "editor"),
-        ("m",    "graph"),
-        ("t",    "terminal"),
-        ("q",    "quit"),
+        ("ctrl+p", "palette"),
+        ("n/↵",    "new agent"),
+        ("⇧A",     "cycle agent"),
+        ("⇧P",     "permissions"),
+        ("] [",    "projects"),
+        ("d",      "detach"),
+        ("r",      "reattach"),
+        ("⇧R",     "run cmd"),
+        ("f",      "files"),
+        ("e",      "editor"),
+        ("m",      "graph"),
+        ("t",      "terminal"),
+        ("q",      "quit"),
     ]
 
     def compose(self) -> ComposeResult:
         parts = []
         for key, desc in self._SHORTCUTS:
-            parts.append(f"[bold]{key}[/bold] {desc}")
+            # Escape [ and ] so Rich doesn't treat them as markup tags
+            safe_key = key.replace("[", r"\[").replace("]", r"\]")
+            parts.append(f"{safe_key} {desc}")
         yield Label("  ·  ".join(parts), classes="sc-rest")
+
+
+# ---------------------------------------------------------------------------
+# BrainImportScreen — modal for importing a brain/memory folder into the vault
+# ---------------------------------------------------------------------------
+
+class BrainImportScreen(ModalScreen):
+    """Prompt for a folder path and import its .md files into the vault."""
+
+    DEFAULT_CSS = """
+    BrainImportScreen {
+        align: center middle;
+    }
+    #brain-import-container {
+        width: 72;
+        height: auto;
+        background: $surface;
+        border: solid $accent;
+        padding: 1 2;
+    }
+    #brain-import-title {
+        text-align: center;
+        color: $accent;
+        margin-bottom: 1;
+    }
+    #brain-import-label {
+        color: $text-muted;
+        margin-bottom: 0;
+    }
+    #brain-import-input {
+        width: 1fr;
+        margin-bottom: 1;
+    }
+    #brain-import-hint {
+        color: $text-muted;
+        text-align: center;
+        margin-top: 1;
+    }
+    """
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="brain-import-container"):
+            yield Label("─── Import Brain / Memory Folder ───", id="brain-import-title")
+            yield Label("Folder path (or single .md file):", id="brain-import-label")
+            yield Input(placeholder="/path/to/your/brain", id="brain-import-input")
+            yield Label("↵=import  Esc=cancel", id="brain-import-hint")
+
+    def on_mount(self) -> None:
+        self.query_one("#brain-import-input", Input).focus()
+
+    def on_key(self, event) -> None:
+        if event.key == "escape":
+            self.dismiss(None)
+            event.stop()
+
+    def on_input_submitted(self, event: Input.Submitted) -> None:
+        path = event.value.strip()
+        if path:
+            self.dismiss(path)
+        else:
+            self.dismiss(None)
 
 
 # ---------------------------------------------------------------------------
@@ -1951,6 +2176,7 @@ class VibeCLIApp(App[None]):
         Binding("t",     "toggle_terminal",  "Terminal"),
         Binding("ctrl+t","toggle_terminal",  "Terminal", show=False),
         Binding("r",     "reattach_menu",    "Reattach"),
+        Binding("B",     "import_brain",     "Import Brain"),
         Binding("s",     "save_file",        "Save"),
         Binding("escape","exit_mode",        "Back", show=False),
         Binding("q",     "quit",             "Quit"),
@@ -2014,6 +2240,9 @@ class VibeCLIApp(App[None]):
         yield ShortcutsBar(id="shortcuts-bar")
 
     async def on_mount(self) -> None:
+        # Re-mount any SSH projects that were saved in projects.json
+        self._remount_ssh_projects()
+
         # Start the PreToolUse HTTP hook server (used in safe permission mode)
         await self._approval_server.start()
 
@@ -2139,6 +2368,12 @@ class VibeCLIApp(App[None]):
             event.stop()
             return
 
+        # ── B (shift+b): import brain/memory folder ───────────────────────
+        if char == "B":
+            self.action_import_brain()
+            event.stop()
+            return
+
     # ------------------------------------------------------------------ actions
 
     # ------------------------------------------------------------------ helpers
@@ -2188,6 +2423,8 @@ class VibeCLIApp(App[None]):
                     self._write_pretooluse_hook(project.path)
                 else:
                     self._remove_pretooluse_hook(project.path)
+            elif self._agent_type == "cursor":
+                self._write_cursor_permissions(project.path, self._perm_mode)
 
         self.notify(
             f"Permission mode → {label}  "
@@ -2206,21 +2443,34 @@ class VibeCLIApp(App[None]):
         self._on_project_changed()
 
     def action_open_project(self) -> None:
-        """Push the directory-picker modal; result is a path string or None."""
+        """Push the directory-picker modal; result is a path string, ssh dict, or None."""
         active = self._pm.active
-        start  = active.path if active else None
+        start  = active.path if (active and not active.is_remote) else None
 
-        def _handle(path: str | None) -> None:
-            if not path:
+        def _handle(result: str | dict | None) -> None:
+            if not result:
                 return
-            path = os.path.expanduser(path)
-            if os.path.isdir(path):
-                self._pm.add_project(path)
-                self._pm.set_active(len(self._pm.projects) - 1)
-                self._on_project_changed()
-                self.notify(f"Opened: {self._pm.active.name}", timeout=3)
+            if isinstance(result, dict):
+                # SSH project — mount already done by the picker
+                path     = result["path"]
+                ssh_info = result["ssh_info"]
+                if os.path.isdir(path):
+                    proj = self._pm.add_ssh_project(path, ssh_info)
+                    self._pm.set_active(len(self._pm.projects) - 1)
+                    self._on_project_changed()
+                    host = ssh_info.get("host", "?")
+                    self.notify(f"Opened remote: {proj.name} ({host})", timeout=4)
+                else:
+                    self.notify(f"Mount path not found: {path}", severity="error", timeout=5)
             else:
-                self.notify(f"Not a valid directory: {path}", severity="error", timeout=5)
+                path = os.path.expanduser(result)
+                if os.path.isdir(path):
+                    self._pm.add_project(path)
+                    self._pm.set_active(len(self._pm.projects) - 1)
+                    self._on_project_changed()
+                    self.notify(f"Opened: {self._pm.active.name}", timeout=3)
+                else:
+                    self.notify(f"Not a valid directory: {path}", severity="error", timeout=5)
 
         self.push_screen(DirectoryPickerScreen(start_path=start), _handle)
 
@@ -2267,6 +2517,96 @@ class VibeCLIApp(App[None]):
                 self.notify(f"Reattached: {state.get('prompt','')[:40]}…", timeout=3)
 
         self.push_screen(DetachMenuScreen(list(detached)), _on_result)
+
+    def action_import_brain(self) -> None:
+        """Open the brain import modal, then run import + profiling in background."""
+        def _on_path(path: str | None) -> None:
+            if not path:
+                return
+            path = os.path.expanduser(path.strip())
+            self.notify(f"Importing brain: {path}", timeout=3)
+            self._run_brain_import(path)
+
+        self.push_screen(BrainImportScreen(), _on_path)
+
+    @work(thread=True)
+    def _run_brain_import(self, path: str) -> None:
+        """Background worker: import .md files then re-run profiling."""
+        try:
+            importer = BrainImporter(self._vault)
+
+            if os.path.isfile(path):
+                result = importer.import_file(path)
+            else:
+                result = importer.import_folder(path)
+
+            if not result.imported:
+                self.call_from_thread(
+                    self.notify,
+                    f"Brain import: no .md files found in {path}",
+                    severity="warning",
+                    timeout=5,
+                )
+                return
+
+            # Update MOC index to include imported brain notes
+            try:
+                self._moc.update_index_moc()
+            except Exception:
+                pass
+
+            # Re-run profiling on the imported corpus + existing prompts
+            try:
+                existing_prompts = self._sugg.get_all_prompts(n=80)
+                # Blend existing prompts with imported text chunks
+                combined_corpus = existing_prompts + result.corpus
+
+                current_profile = self._user_profile.read_json()
+                if not current_profile:
+                    current_profile = self._profile_analyzer.build_basic_profile(combined_corpus)
+
+                if self._profile_analyzer.is_available():
+                    enriched = self._profile_analyzer.build_forensic_profile(
+                        prompt="[brain import]",
+                        project="brain",
+                        all_prompts=combined_corpus,
+                        current_profile=current_profile,
+                    )
+                    new_profile = enriched if enriched else current_profile
+                else:
+                    basic = self._profile_analyzer.build_basic_profile(combined_corpus)
+                    new_profile = {**basic, **{
+                        k: current_profile.get(k, basic.get(k, {}))
+                        for k in ("demographics", "personality", "inferences")
+                    }}
+                    new_profile["technical_interests"] = basic["technical_interests"]
+                    new_profile["behavioral_patterns"] = basic["behavioral_patterns"]
+                    new_profile["prompting_style"]     = basic["prompting_style"]
+
+                self._user_profile.write_json(new_profile)
+            except Exception:
+                pass
+
+            skip_msg = f"  ({len(result.skipped)} skipped)" if result.skipped else ""
+            self.call_from_thread(
+                self.notify,
+                f"Brain imported: {len(result.imported)} notes{skip_msg}. Profile updated.",
+                timeout=6,
+            )
+
+            # Refresh graph pane if visible
+            if self._show_graph:
+                self.call_from_thread(
+                    self.query_one("#graph-pane", GraphPane).refresh_tree
+                )
+
+        except Exception as exc:
+            self.call_from_thread(
+                self.notify,
+                f"Brain import failed: {exc}",
+                severity="error",
+                timeout=6,
+            )
 
     def action_scroll_down(self) -> None:
         self.query_one("#agent-panel", AgentPanel).scroll_down()
@@ -2423,10 +2763,17 @@ class VibeCLIApp(App[None]):
         self._sugg.record(active.name, prompt)
         self._pers.save()
 
-        # "safe" and "accept_edits" both use the PreToolUse HTTP hook.
-        # "bypass" skips it entirely (--dangerously-skip-permissions handles gating).
-        if self._perm_mode in ("safe", "accept_edits") and self._agent_type == "claude":
-            self._write_pretooluse_hook(active.path)
+        # Claude: PreToolUse HTTP hook for interactive approval (not needed in plan
+        #         mode — Claude enforces read-only natively via --permission-mode plan).
+        # Cursor: write .cursor/cli.json deny rules (native permission config).
+        # Codex:  permission enforced via --sandbox flag in CodexSession.
+        if self._agent_type == "claude":
+            if self._perm_mode in ("safe", "accept_edits"):
+                self._write_pretooluse_hook(active.path)
+            else:
+                self._remove_pretooluse_hook(active.path)
+        elif self._agent_type == "cursor":
+            self._write_cursor_permissions(active.path, self._perm_mode)
 
         session = self._make_session(prompt, active.path)
         self.query_one("#agent-panel", AgentPanel).add_agent(
@@ -2804,6 +3151,28 @@ class VibeCLIApp(App[None]):
         with open(settings_path, "w") as f:
             _json.dump(settings, f, indent=2)
 
+    # Cursor permission modes → .cursor/cli.json deny rules
+    # safe:         deny all writes + shell commands (read-only)
+    # accept_edits: deny shell commands only (file edits OK; --force enables writes in print mode)
+    # bypass:       no deny rules (--force allows everything)
+    _CURSOR_PERM_DENY: dict[str, list[str]] = {
+        "plan":         ["Shell(*)", "Write(**/**)"],  # read-only; --plan flag also enforces this
+        "safe":         ["Shell(*)", "Write(**/**)"],
+        "accept_edits": ["Shell(*)"],
+        "bypass":       [],
+    }
+
+    def _write_cursor_permissions(self, project_path: str, perm_mode: str) -> None:
+        """Write .cursor/cli.json with deny rules matching the vibe-cli permission mode."""
+        import json as _json
+        cursor_dir = os.path.join(project_path, ".cursor")
+        os.makedirs(cursor_dir, exist_ok=True)
+        cli_json   = os.path.join(cursor_dir, "cli.json")
+        deny       = self._CURSOR_PERM_DENY.get(perm_mode, self._CURSOR_PERM_DENY["accept_edits"])
+        config     = {"version": 1, "permissions": {"allow": [], "deny": deny}}
+        with open(cli_json, "w") as f:
+            _json.dump(config, f, indent=2)
+
     @work(thread=True)
     def _auto_git_commit(self, project_path: str, prompt: str) -> None:
         import subprocess
@@ -2856,11 +3225,42 @@ class VibeCLIApp(App[None]):
         )
         self.query_one("#prompt-bar", PromptBar).suggestions = suggestions
 
+    # ------------------------------------------------------------------ SSH mount lifecycle
+
+    def _remount_ssh_projects(self) -> None:
+        """On startup, re-mount any SSH projects from projects.json (best-effort)."""
+        from core.ssh_mount import SSHInfo, mount as ssh_mount, is_available as sshfs_ok
+        if not sshfs_ok():
+            return
+        for proj in self._pm.projects:
+            if not proj.ssh_info:
+                continue
+            try:
+                info  = SSHInfo.from_dict(proj.ssh_info)
+                local = ssh_mount(info, timeout=20)
+                proj.path = local   # update in case mount dir changed
+            except Exception as exc:
+                self.notify(
+                    f"Could not remount {proj.ssh_info.get('host','?')}: {exc}",
+                    severity="warning", timeout=6,
+                )
+
+    def _unmount_ssh_projects(self) -> None:
+        """On quit, unmount all sshfs-mounted projects (best-effort)."""
+        from core.ssh_mount import unmount as ssh_unmount
+        for proj in self._pm.projects:
+            if proj.ssh_info:
+                try:
+                    ssh_unmount(proj.path)
+                except Exception:
+                    pass
+
     # ------------------------------------------------------------------ session persistence
 
     def action_quit(self) -> None:
-        """Save session state then quit."""
+        """Save session state, unmount SSH filesystems, then quit."""
         self._save_session()
+        self._unmount_ssh_projects()
         self.exit()
 
     def _save_session(self) -> None:

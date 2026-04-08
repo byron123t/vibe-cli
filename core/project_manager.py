@@ -17,6 +17,20 @@ class Project:
     path: str
     active_file: str = ""        # relative to project root
     pinned_files: list[str] = field(default_factory=list)
+    ssh_info: dict | None = None  # set for remote SSH projects
+
+    @property
+    def is_remote(self) -> bool:
+        return self.ssh_info is not None
+
+    @property
+    def display_name(self) -> str:
+        """Tab label — shows remote indicator for SSH projects."""
+        if self.ssh_info:
+            host = self.ssh_info.get("host", "?")
+            rpath = self.ssh_info.get("remote_path", "")
+            return f"⟁ {self.name} ({host}:{rpath})"
+        return self.name
 
     def resolve_active_file(self) -> str | None:
         """Return absolute path of active_file if it exists."""
@@ -67,6 +81,22 @@ class ProjectManager:
         self._save()
         return proj
 
+    def add_ssh_project(self, local_mount: str, ssh_info: dict) -> Project:
+        """Add a remote project backed by an sshfs mount at local_mount."""
+        local_mount = os.path.abspath(local_mount)
+        for p in self._projects:
+            if p.path == local_mount:
+                p.ssh_info = ssh_info
+                self._save()
+                return p
+        # Use remote basename as name, fall back to host
+        remote_path = ssh_info.get("remote_path", "")
+        name = os.path.basename(remote_path.rstrip("/")) or ssh_info.get("host", "remote")
+        proj = Project(name=name, path=local_mount, ssh_info=ssh_info)
+        self._projects.append(proj)
+        self._save()
+        return proj
+
     def remove_project(self, idx: int) -> None:
         if 0 <= idx < len(self._projects):
             self._projects.pop(idx)
@@ -110,12 +140,17 @@ class ProjectManager:
 
     def _save(self) -> None:
         os.makedirs(os.path.dirname(PROJECTS_FILE), exist_ok=True)
-        data = [
-            {"name": p.name, "path": p.path,
-             "active_file": p.active_file,
-             "pinned_files": p.pinned_files}
-            for p in self._projects
-        ]
+        data = []
+        for p in self._projects:
+            entry: dict = {
+                "name":         p.name,
+                "path":         p.path,
+                "active_file":  p.active_file,
+                "pinned_files": p.pinned_files,
+            }
+            if p.ssh_info:
+                entry["ssh_info"] = p.ssh_info
+            data.append(entry)
         with open(PROJECTS_FILE, "w") as f:
             json.dump(data, f, indent=2)
 
@@ -126,14 +161,18 @@ class ProjectManager:
             with open(PROJECTS_FILE) as f:
                 data = json.load(f)
             for item in data:
-                path = item.get("path", "")
-                if os.path.isdir(path):
-                    proj = Project(
-                        name=item.get("name", os.path.basename(path)),
-                        path=path,
-                        active_file=item.get("active_file", ""),
-                        pinned_files=item.get("pinned_files", []),
-                    )
-                    self._projects.append(proj)
+                path     = item.get("path", "")
+                ssh_info = item.get("ssh_info")
+                # Local projects must exist; SSH projects are re-mounted later
+                if not ssh_info and not os.path.isdir(path):
+                    continue
+                proj = Project(
+                    name=item.get("name", os.path.basename(path)),
+                    path=path,
+                    active_file=item.get("active_file", ""),
+                    pinned_files=item.get("pinned_files", []),
+                    ssh_info=ssh_info,
+                )
+                self._projects.append(proj)
         except Exception:
             pass

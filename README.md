@@ -1,6 +1,6 @@
 # vibe-cli
 
-Keyboard-first multi-project AI coding terminal. Run Claude Code, Codex, or Cursor agents across many projects simultaneously — switch between them instantly, approve tool calls inline, and never touch the mouse.
+One interface to rule them all! Agent-first multiplexing CLI-style IDE. Like vim on steroids. Run Claude Code, Codex, and Cursor agents across many projects simultaneously. Zero-friction context switching. Perfect for those 10x engineers with ADHD, 100+ side projects, or, if you just like CLI and terminal text-editor UIs. In usability tests, `vibe-cli` will let you achieve up to 67 APM (that's agents per minute).
 
 ![vibe-cli screenshot](static/screenshot.png)
 

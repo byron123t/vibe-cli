@@ -71,16 +71,21 @@ class CursorSession(AgentSession):
         on_line: Callable[[str], None] | None = None,
         on_permission_request: Callable[[dict], None] | None = None,
     ) -> int:
-        # safe → --trust; accept_edits/bypass → --force (implies trust)
-        if self.permission_mode in ("accept_edits", "bypass"):
-            trust_flags = ["--force"]
+        # plan         → --plan (read-only / planning mode, no writes or exec)
+        # safe         → --trust (workspace trust, writes blocked by cli.json deny rules)
+        # accept_edits → --force (auto-approve file edits; shell blocked by cli.json)
+        # bypass       → --force (allow everything)
+        if self.permission_mode == "plan":
+            mode_flags = ["--plan", "--trust"]
+        elif self.permission_mode in ("accept_edits", "bypass"):
+            mode_flags = ["--force"]
         else:
-            trust_flags = ["--trust"]
+            mode_flags = ["--trust"]
 
         cmd = ["agent", "--print", "--output-format", "stream-json"]
         if self.resume_session_id:
             cmd += ["--resume", self.resume_session_id]
-        cmd += trust_flags + self.extra_flags + [self.prompt]
+        cmd += mode_flags + self.extra_flags + [self.prompt]
 
         try:
             self._proc = await asyncio.create_subprocess_exec(

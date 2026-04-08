@@ -1,14 +1,15 @@
 ### TODOS
 - [ ] `man` option with details
-- [ ] Memory/brain importing
-- [ ] LLM-powered user profiling and prompt personalization
-- [ ] Remote ssh support
-- [ ] Plan mode
-- [ ] Cycling between models and effort
+- [x] Memory/brain importing
+- [x] LLM-powered user profiling and prompt personalization
+- [x] Remote ssh support
+- [x] Plan mode
+- [x] Cycling between models
+- [ ] Cycling between effort
 - [ ] Manually setting [1-9] keyboard prompt shortcuts
 - [ ] More support for agent commands (claude-native command format) /fork, /effort, etc.)
 - [ ] More support for parameters (max $, model, session id, etc.)
-- [ ] Tests for cursor and codex
+- [x] Tests for cursor and codex
 - [ ] Updated screenshots and screen recording gifs
 - [ ] Support and tests for agent orchestration (/agents)
 - [ ] Support and tests for tooling
