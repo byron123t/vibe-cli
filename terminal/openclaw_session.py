@@ -137,9 +137,10 @@ class OpenClawSession(AgentSession):
             "--thinking", thinking,
         ]
 
-        # Optional model override from config or extra_flags
-        if cfg.model:
-            cmd += ["--model", cfg.model]
+        # model_override (from /model command) takes precedence over config
+        model = self.model_override or cfg.model
+        if model:
+            cmd += ["--model", model]
 
         # Optional channel delivery
         if self._deliver_to:

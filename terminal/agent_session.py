@@ -25,12 +25,14 @@ class AgentSession(ABC):
         extra_flags: list[str] | None = None,
         resume_session_id: str | None = None,
         effort_mode: str = "medium",
+        model_override: str = "",
     ) -> None:
         self.session_id         = session_id or str(uuid.uuid4())[:8]
         self.prompt             = prompt
         self.project_path       = project_path
         self.permission_mode    = permission_mode
         self.effort_mode        = effort_mode   # "low" | "medium" | "high"
+        self.model_override     = model_override  # overrides default model when non-empty
         self.extra_flags        = extra_flags or []
         self.resume_session_id  = resume_session_id   # for --resume / continuation
         self.start_time         = time.time()

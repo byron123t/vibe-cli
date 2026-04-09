@@ -95,6 +95,8 @@ class ClaudeSession(AgentSession):
         cmd = ["claude", "--print", "--verbose", "--output-format", "stream-json"]
         if self.resume_session_id:
             cmd += ["--resume", self.resume_session_id]
+        if self.model_override:
+            cmd += ["--model", self.model_override]
         cmd += perm_flags + self.extra_flags + [prompt]
 
         try:
