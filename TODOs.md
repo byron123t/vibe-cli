@@ -8,7 +8,7 @@
 - [x] Cycling between effort
 - [x] Manually setting [1-9] keyboard prompt shortcuts
 - [x] More support for agent commands (claude-native command format) /fork, /effort, etc.)
-- [ ] More support for parameters (max $, model, session id, etc.)
+- [x] More support for parameters (max $, model, session id, etc.)
 - [x] Tests for cursor and codex
 - [ ] Updated screenshots and screen recording gifs
 - [ ] Support and tests for agent orchestration (/agents)

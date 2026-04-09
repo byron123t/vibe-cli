@@ -97,6 +97,16 @@ class ClaudeSession(AgentSession):
             cmd += ["--resume", self.resume_session_id]
         if self.model_override:
             cmd += ["--model", self.model_override]
+        if self.max_turns is not None:
+            cmd += ["--max-turns", str(self.max_turns)]
+        if self.max_budget_usd is not None:
+            cmd += ["--max-budget-usd", f"{self.max_budget_usd:.2f}"]
+        if self.system_prompt:
+            cmd += ["--append-system-prompt", self.system_prompt]
+        for tool in self.allowed_tools:
+            cmd += ["--allowedTools", tool]
+        for tool in self.disallowed_tools:
+            cmd += ["--disallowedTools", tool]
         cmd += perm_flags + self.extra_flags + [prompt]
 
         try:

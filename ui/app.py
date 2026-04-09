@@ -2136,6 +2136,7 @@ class StatusBar(Static):
     .sb-project { color: $text-muted; padding: 0 2; width: 1fr; }
     .sb-agent   { padding: 0 2; }
     .sb-perm    { padding: 0 2; }
+    .sb-limits  { padding: 0 2; color: $text-muted; }
     .sb-effort  { padding: 0 2; text-align: right; }
     """
 
@@ -2143,6 +2144,7 @@ class StatusBar(Static):
         yield Label("", id="sb-project", classes="sb-project")
         yield Label("", id="sb-agent",   classes="sb-agent")
         yield Label("", id="sb-perm",    classes="sb-perm")
+        yield Label("", id="sb-limits",  classes="sb-limits")
         yield Label("", id="sb-effort",  classes="sb-effort")
 
     def update_project(self, name: str) -> None:
@@ -2155,6 +2157,32 @@ class StatusBar(Static):
     def update_perm(self, mode: str) -> None:
         label, color = _PERM_LABELS.get(mode, ("?", "$text"))
         self.query_one("#sb-perm", Label).update(f"[{color}]{label}[/{color}]")
+
+    def update_limits(
+        self,
+        max_turns: int | None,
+        max_budget_usd: float | None,
+        system_prompt: str,
+        allowed_tools: list[str],
+        disallowed_tools: list[str],
+        model_override: str,
+    ) -> None:
+        parts: list[str] = []
+        if max_budget_usd is not None:
+            parts.append(f"${max_budget_usd:.2f}")
+        if max_turns is not None:
+            parts.append(f"{max_turns}t")
+        if model_override:
+            short = model_override.split("/")[-1][:12]
+            parts.append(short)
+        if system_prompt:
+            parts.append("sys")
+        if allowed_tools:
+            parts.append(f"+{len(allowed_tools)}tool")
+        if disallowed_tools:
+            parts.append(f"-{len(disallowed_tools)}tool")
+        text = "  ".join(parts)
+        self.query_one("#sb-limits", Label).update(f"[dim]{text}[/dim]" if text else "")
 
     def update_effort(self, mode: str) -> None:
         label, color = _EFFORT_LABELS.get(mode, ("?", "$text"))
@@ -2471,6 +2499,13 @@ class VibeCLIApp(App[None]):
         # Optional model override set via /model command (empty = use agent default)
         self._model_override: str = ""
 
+        # Session-scoped limits / overrides (set via slash commands)
+        self._max_turns:       int | None   = None
+        self._max_budget_usd:  float | None = None
+        self._system_prompt:   str          = ""
+        self._allowed_tools:   list[str]    = []
+        self._disallowed_tools: list[str]   = []
+
         # SDK client, profile analyzer, and memory infrastructure
         self._sdk              = ClaudeSDKClient(config)
         self._profile_analyzer = ProfileAnalyzer(self._sdk)
@@ -2540,6 +2575,7 @@ class VibeCLIApp(App[None]):
         self.query_one("#status-bar", StatusBar).update_agent(self._agent_type)
         self.query_one("#status-bar", StatusBar).update_perm(self._perm_mode)
         self.query_one("#status-bar", StatusBar).update_effort(self._effort_mode)
+        self._refresh_limits_bar()
 
         # If OpenClaw is the active agent, check gateway status in background
         if self._agent_type == "openclaw":
@@ -3153,6 +3189,11 @@ class VibeCLIApp(App[None]):
             permission_mode=self._perm_mode,
             effort_mode=self._effort_mode,
             model_override=self._model_override,
+            max_turns=self._max_turns,
+            max_budget_usd=self._max_budget_usd,
+            system_prompt=self._system_prompt,
+            allowed_tools=list(self._allowed_tools),
+            disallowed_tools=list(self._disallowed_tools),
             resume_session_id=resume_session_id,
         )
         if self._agent_type == "codex":
@@ -3592,6 +3633,11 @@ class VibeCLIApp(App[None]):
             "/perm":         self._scmd_perm,
             "/permissions":  self._scmd_perm,
             "/model":        self._scmd_model,
+            "/budget":       self._scmd_budget,
+            "/turns":        self._scmd_turns,
+            "/max-turns":    self._scmd_turns,
+            "/system":       self._scmd_system,
+            "/tools":        self._scmd_tools,
             "/clear":        self._scmd_clear,
             "/compact":      self._scmd_compact,
             "/fork":         self._scmd_fork,
@@ -3696,6 +3742,135 @@ class VibeCLIApp(App[None]):
                     timeout=5,
                 )
 
+    def _scmd_budget(self, arg: str) -> None:
+        if arg:
+            # Accept "$5", "5", "5.00"
+            cleaned = arg.lstrip("$").strip()
+            try:
+                amount = float(cleaned)
+                self._max_budget_usd = amount
+                self._refresh_limits_bar()
+                self.notify(
+                    f"Budget cap → ${amount:.2f} per session  (Claude only)  "
+                    "·  /budget to clear",
+                    timeout=4,
+                )
+            except ValueError:
+                self.notify(
+                    f"Invalid amount: '{arg}'  ·  usage: /budget 5.00",
+                    severity="warning", timeout=4,
+                )
+        else:
+            if self._max_budget_usd is not None:
+                self._max_budget_usd = None
+                self._refresh_limits_bar()
+                self.notify("Budget cap cleared.", timeout=3)
+            else:
+                self.notify(
+                    "No budget cap set.  Usage: /budget <amount>  e.g. /budget 2.50",
+                    timeout=4,
+                )
+
+    def _scmd_turns(self, arg: str) -> None:
+        if arg:
+            try:
+                n = int(arg)
+                if n < 1:
+                    raise ValueError
+                self._max_turns = n
+                self._refresh_limits_bar()
+                agent_note = "(Claude: max turns · Codex: attempts 1-4)"
+                self.notify(f"Max turns → {n}  {agent_note}  ·  /turns to clear", timeout=4)
+            except ValueError:
+                self.notify(
+                    f"Invalid number: '{arg}'  ·  usage: /turns 10",
+                    severity="warning", timeout=4,
+                )
+        else:
+            if self._max_turns is not None:
+                self._max_turns = None
+                self._refresh_limits_bar()
+                self.notify("Max turns limit cleared.", timeout=3)
+            else:
+                self.notify(
+                    "No turn limit set.  Usage: /turns <n>  e.g. /turns 20",
+                    timeout=4,
+                )
+
+    def _scmd_system(self, arg: str) -> None:
+        if arg:
+            self._system_prompt = arg
+            self._refresh_limits_bar()
+            preview = arg[:60] + ("…" if len(arg) > 60 else "")
+            self.notify(
+                f"System prompt → \"{preview}\"  "
+                "(appended to each session, Claude only)  ·  /system to clear",
+                timeout=5,
+            )
+        else:
+            if self._system_prompt:
+                self._system_prompt = ""
+                self._refresh_limits_bar()
+                self.notify("System prompt cleared.", timeout=3)
+            else:
+                self.notify(
+                    "No system prompt set.  Usage: /system <text>",
+                    timeout=4,
+                )
+
+    def _scmd_tools(self, arg: str) -> None:
+        """
+        /tools allow <pattern> [pattern …]   — add to allowed tools list
+        /tools deny  <pattern> [pattern …]   — add to disallowed tools list
+        /tools clear                          — clear both lists
+        /tools                                — show current lists
+        """
+        parts = arg.split(None, 1)
+        sub   = parts[0].lower() if parts else ""
+        rest  = parts[1].strip() if len(parts) > 1 else ""
+
+        if sub == "allow":
+            if not rest:
+                self.notify("Usage: /tools allow <pattern>  e.g. /tools allow Bash(git*)", timeout=4)
+                return
+            new = [p.strip() for p in rest.split(",") if p.strip()]
+            self._allowed_tools = list(dict.fromkeys(self._allowed_tools + new))
+            self._refresh_limits_bar()
+            self.notify(f"Allowed tools: {', '.join(self._allowed_tools)}", timeout=4)
+
+        elif sub == "deny":
+            if not rest:
+                self.notify("Usage: /tools deny <pattern>  e.g. /tools deny Bash(*)", timeout=4)
+                return
+            new = [p.strip() for p in rest.split(",") if p.strip()]
+            self._disallowed_tools = list(dict.fromkeys(self._disallowed_tools + new))
+            self._refresh_limits_bar()
+            self.notify(f"Disallowed tools: {', '.join(self._disallowed_tools)}", timeout=4)
+
+        elif sub == "clear":
+            self._allowed_tools    = []
+            self._disallowed_tools = []
+            self._refresh_limits_bar()
+            self.notify("Tool lists cleared.", timeout=3)
+
+        elif sub == "remove":
+            pattern = rest.strip()
+            if pattern in self._allowed_tools:
+                self._allowed_tools.remove(pattern)
+            if pattern in self._disallowed_tools:
+                self._disallowed_tools.remove(pattern)
+            self._refresh_limits_bar()
+            self.notify(f"Removed '{pattern}' from tool lists.", timeout=3)
+
+        else:
+            allow_str = ", ".join(self._allowed_tools)  or "none"
+            deny_str  = ", ".join(self._disallowed_tools) or "none"
+            self.notify(
+                f"Allowed: {allow_str}\nDenied: {deny_str}\n"
+                "Usage: /tools allow|deny|remove|clear <pattern>",
+                timeout=6,
+            )
+
     def _scmd_clear(self, _arg: str) -> None:
         """Clear agent panel for non-Claude agents; pass through for Claude."""
         if self._agent_type == "claude":
@@ -3770,17 +3945,21 @@ class VibeCLIApp(App[None]):
 
     def _scmd_help(self, _arg: str) -> None:
         lines = [
-            "/effort [low|medium|high]   — set reasoning depth",
-            "/agent  [claude|codex|cursor|openclaw]  — switch agent",
-            "/perm   [plan|safe|accept_edits|bypass] — set permissions",
-            "/model  [provider/id]       — override model (Claude & OpenClaw)",
-            "/fork   [instruction]       — fork conversation with context",
-            "/clear                      — clear agent panel",
-            "/compact                    — compact / clear history",
-            "/help                       — show this message",
-            "Claude also handles: /init /memory /config /review …",
+            "/effort  [low|medium|high]              set reasoning depth",
+            "/agent   [claude|codex|cursor|openclaw] switch agent",
+            "/perm    [plan|safe|accept_edits|bypass] set permissions",
+            "/model   [provider/id]                  override model",
+            "/budget  [amount]                       USD spending cap (Claude)",
+            "/turns   [n]                            max turns/attempts",
+            "/system  [text]                         append to system prompt",
+            "/tools   allow|deny|remove|clear <pat>  tool access lists",
+            "/fork    [instruction]                  fork with context",
+            "/clear                                  clear panel",
+            "/compact                                compact history",
+            "/help                                   show this message",
+            "Claude also accepts: /init /memory /config /review …",
         ]
-        self.notify("\n".join(lines), title="Slash commands", timeout=12)
+        self.notify("\n".join(lines), title="Slash commands", timeout=14)
 
     # ------------------------------------------------------------------ manual shortcuts
 
@@ -3820,6 +3999,16 @@ class VibeCLIApp(App[None]):
             pass
         # Refresh the PromptBar display
         self.query_one("#prompt-bar", PromptBar).manual_shortcuts = list(self._manual_shortcuts)
+
+    def _refresh_limits_bar(self) -> None:
+        self.query_one("#status-bar", StatusBar).update_limits(
+            max_turns       = self._max_turns,
+            max_budget_usd  = self._max_budget_usd,
+            system_prompt   = self._system_prompt,
+            allowed_tools   = self._allowed_tools,
+            disallowed_tools= self._disallowed_tools,
+            model_override  = self._model_override,
+        )
 
     def _refresh_suggestions(self) -> None:
         active = self._pm.active
@@ -3997,6 +4186,7 @@ class VibeCLIApp(App[None]):
         self.query_one("#status-bar", StatusBar).update_agent(self._agent_type)
         self.query_one("#status-bar", StatusBar).update_perm(self._perm_mode)
         self.query_one("#status-bar", StatusBar).update_effort(self._effort_mode)
+        self._refresh_limits_bar()
 
         # Restore detached agents
         self._detached = state.get("detached", {})

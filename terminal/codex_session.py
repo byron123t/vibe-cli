@@ -89,7 +89,13 @@ class CodexSession(AgentSession):
         if self.permission_mode == "plan":
             prompt = _PLAN_PREFIX + prompt
         prompt = _EFFORT_PREFIX.get(self.effort_mode, "") + prompt
-        cmd = ["codex", "exec", "--json"] + perm_flags + self.extra_flags + [prompt]
+
+        cmd = ["codex", "exec", "--json"] + perm_flags
+        # --attempts (1-4): best-of-N runs; reuse max_turns as the knob for this
+        if self.max_turns is not None:
+            attempts = max(1, min(4, self.max_turns))
+            cmd += ["--attempts", str(attempts)]
+        cmd += self.extra_flags + [prompt]
 
         try:
             self._proc = await asyncio.create_subprocess_exec(
