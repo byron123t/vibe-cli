@@ -32,6 +32,13 @@ def _strip_ansi(text: str) -> str:
     return re.sub(r"\x1b\[[0-9;]*[mKHFABCDJG]", "", text)
 
 
+_EFFORT_PREFIX: dict[str, str] = {
+    "low":  "Be concise. Give a brief, direct answer without extra explanation. ",
+    "high": "Think step-by-step and reason thoroughly before answering. "
+            "Consider edge cases and alternatives carefully. ",
+}
+
+
 def _tool_name_from_key(key: str) -> str:
     """Convert 'shellToolCall' → 'Shell', 'editFileToolCall' → 'Edit File'."""
     name = re.sub(r"ToolCall$", "", key)
@@ -82,10 +89,11 @@ class CursorSession(AgentSession):
         else:
             mode_flags = ["--trust"]
 
+        prompt = _EFFORT_PREFIX.get(self.effort_mode, "") + self.prompt
         cmd = ["agent", "--print", "--output-format", "stream-json"]
         if self.resume_session_id:
             cmd += ["--resume", self.resume_session_id]
-        cmd += mode_flags + self.extra_flags + [self.prompt]
+        cmd += mode_flags + self.extra_flags + [prompt]
 
         try:
             self._proc = await asyncio.create_subprocess_exec(

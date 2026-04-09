@@ -24,11 +24,13 @@ class AgentSession(ABC):
         permission_mode: str = "accept_edits",
         extra_flags: list[str] | None = None,
         resume_session_id: str | None = None,
+        effort_mode: str = "medium",
     ) -> None:
         self.session_id         = session_id or str(uuid.uuid4())[:8]
         self.prompt             = prompt
         self.project_path       = project_path
         self.permission_mode    = permission_mode
+        self.effort_mode        = effort_mode   # "low" | "medium" | "high"
         self.extra_flags        = extra_flags or []
         self.resume_session_id  = resume_session_id   # for --resume / continuation
         self.start_time         = time.time()

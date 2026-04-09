@@ -58,6 +58,12 @@ PERMISSION_FLAGS: dict[str, list[str]] = {
 # Tools auto-approved in "accept_edits" mode.
 # These are read/write file operations that are trivially reversible via git.
 # Any tool NOT in this set still shows the user a TUI confirmation prompt.
+_EFFORT_PREFIX: dict[str, str] = {
+    "low":  "Be concise. Give a brief, direct answer without extra explanation. ",
+    "high": "Think step-by-step and reason thoroughly before answering. "
+            "Consider edge cases and alternatives carefully. ",
+}
+
 ACCEPT_EDITS_AUTO_APPROVE: frozenset[str] = frozenset({
     "Read", "Write", "Edit", "MultiEdit",
     "Glob", "Grep", "LS",
@@ -85,10 +91,11 @@ class ClaudeSession(AgentSession):
         on_permission_request: Callable[[dict], None] | None = None,
     ) -> int:
         perm_flags = PERMISSION_FLAGS.get(self.permission_mode, [])
+        prompt = _EFFORT_PREFIX.get(self.effort_mode, "") + self.prompt
         cmd = ["claude", "--print", "--verbose", "--output-format", "stream-json"]
         if self.resume_session_id:
             cmd += ["--resume", self.resume_session_id]
-        cmd += perm_flags + self.extra_flags + [self.prompt]
+        cmd += perm_flags + self.extra_flags + [prompt]
 
         try:
             self._proc = await asyncio.create_subprocess_exec(

@@ -1477,8 +1477,12 @@ class ProjectTabBar(Static):
     def _make_buttons(self):
         for i, p in enumerate(self._projects):
             cls = "tab active" if i == self._active else "tab"
-            yield Button(self._tab_label(i, p.display_name), id=f"ptab-{i}", classes=cls)
-        yield Button("⊕", id="ptab-add", classes="tab-add")
+            btn = Button(self._tab_label(i, p.display_name), id=f"ptab-{i}", classes=cls)
+            btn.can_focus = False
+            yield btn
+        add_btn = Button("⊕", id="ptab-add", classes="tab-add")
+        add_btn.can_focus = False
+        yield add_btn
 
     # ── update ───────────────────────────────────────────────────────
 
@@ -1560,11 +1564,13 @@ class PromptBar(Static):
 
     def compose(self) -> ComposeResult:
         yield Static("", id="pb-sugg", classes="pb-suggestions")
-        yield Input(
+        inp = Input(
             placeholder="› n or Enter to focus · type prompt · Tab=cycle suggestions · Escape=back",
             id="pb-input",
             classes="pb-input",
         )
+        inp.can_focus = False
+        yield inp
 
     def watch_suggestions(self, suggestions: list[str]) -> None:
         row = self.query_one("#pb-sugg", Static)
@@ -1896,6 +1902,13 @@ _AGENT_LABELS: dict[str, tuple[str, str]] = {
 }
 _AGENT_CYCLE = ["claude", "codex", "cursor", "openclaw"]
 
+_EFFORT_LABELS: dict[str, tuple[str, str]] = {
+    "low":    ("LOW ⚡",   "$success"),
+    "medium": ("MEDIUM",  "$text-muted"),
+    "high":   ("HIGH 🧠", "$warning"),
+}
+_EFFORT_CYCLE = ["low", "medium", "high"]
+
 
 class OpenClawInboxPanel(Static):
     """
@@ -2020,7 +2033,7 @@ class OpenClawInboxPanel(Static):
 
 
 class StatusBar(Static):
-    """Thin bar showing agent type, permission mode, and active project."""
+    """Thin bar showing agent type, permission mode, active project, and effort."""
 
     DEFAULT_CSS = """
     StatusBar {
@@ -2031,13 +2044,15 @@ class StatusBar(Static):
     }
     .sb-project { color: $text-muted; padding: 0 2; width: 1fr; }
     .sb-agent   { padding: 0 2; }
-    .sb-perm    { padding: 0 2; text-align: right; }
+    .sb-perm    { padding: 0 2; }
+    .sb-effort  { padding: 0 2; text-align: right; }
     """
 
     def compose(self) -> ComposeResult:
         yield Label("", id="sb-project", classes="sb-project")
         yield Label("", id="sb-agent",   classes="sb-agent")
         yield Label("", id="sb-perm",    classes="sb-perm")
+        yield Label("", id="sb-effort",  classes="sb-effort")
 
     def update_project(self, name: str) -> None:
         self.query_one("#sb-project", Label).update(f" ⬡ {name}")
@@ -2049,6 +2064,14 @@ class StatusBar(Static):
     def update_perm(self, mode: str) -> None:
         label, color = _PERM_LABELS.get(mode, ("?", "$text"))
         self.query_one("#sb-perm", Label).update(f"[{color}]{label}[/{color}]")
+
+    def update_effort(self, mode: str) -> None:
+        label, color = _EFFORT_LABELS.get(mode, ("?", "$text"))
+        # Hide "MEDIUM" to keep the bar uncluttered at the default level
+        if mode == "medium":
+            self.query_one("#sb-effort", Label).update("")
+        else:
+            self.query_one("#sb-effort", Label).update(f"[{color}]{label}[/{color}]")
 
     def update_openclaw_status(self, reachable: bool, channels: list[str]) -> None:
         """Append gateway + channel info when OpenClaw is the active agent."""
@@ -2088,6 +2111,7 @@ class ShortcutsBar(Static):
         ("n/↵",    "new agent"),
         ("⇧A",     "cycle agent"),
         ("⇧P",     "permissions"),
+        ("⇧E",     "effort"),
         ("] [",    "projects"),
         ("d",      "detach"),
         ("r",      "reattach"),
@@ -2321,6 +2345,7 @@ class VibeCLIApp(App[None]):
         Binding("ctrl+t","toggle_terminal",  "Terminal", show=False),
         Binding("r",     "reattach_menu",    "Reattach"),
         Binding("c",     "toggle_inbox",     "Channels"),
+        Binding("E",     "cycle_effort",     "Effort"),
         Binding("B",     "import_brain",     "Import Brain"),
         Binding("s",     "save_file",        "Save"),
         Binding("escape","exit_mode",        "Back", show=False),
@@ -2348,6 +2373,9 @@ class VibeCLIApp(App[None]):
 
         # Permission mode: "safe" | "accept_edits" | "bypass"
         self._perm_mode: str = config.get("claude", {}).get("permission_mode", "accept_edits")
+
+        # Effort mode: "low" | "medium" | "high"
+        self._effort_mode: str = config.get("agent", {}).get("effort", "medium")
 
         # SDK client, profile analyzer, and memory infrastructure
         self._sdk              = ClaudeSDKClient(config)
@@ -2414,6 +2442,7 @@ class VibeCLIApp(App[None]):
 
         self.query_one("#status-bar", StatusBar).update_agent(self._agent_type)
         self.query_one("#status-bar", StatusBar).update_perm(self._perm_mode)
+        self.query_one("#status-bar", StatusBar).update_effort(self._effort_mode)
 
         # If OpenClaw is the active agent, check gateway status in background
         if self._agent_type == "openclaw":
@@ -2524,6 +2553,12 @@ class VibeCLIApp(App[None]):
             event.stop()
             return
 
+        # ── E (shift+e): cycle effort level ──────────────────────────────
+        if char == "E":
+            self.action_cycle_effort()
+            event.stop()
+            return
+
         # ── B (shift+b): import brain/memory folder ───────────────────────
         if char == "B":
             self.action_import_brain()
@@ -2575,6 +2610,13 @@ class VibeCLIApp(App[None]):
         else:
             # Switched away from OpenClaw — stop gateway client
             self._stop_gateway_client()
+
+    def action_cycle_effort(self) -> None:
+        idx = _EFFORT_CYCLE.index(self._effort_mode) if self._effort_mode in _EFFORT_CYCLE else 1
+        self._effort_mode = _EFFORT_CYCLE[(idx + 1) % len(_EFFORT_CYCLE)]
+        self.query_one("#status-bar", StatusBar).update_effort(self._effort_mode)
+        label, _ = _EFFORT_LABELS[self._effort_mode]
+        self.notify(f"Effort → {label}", timeout=3)
 
     def _cycle_permissions(self) -> None:
         idx = _PERM_CYCLE.index(self._perm_mode) if self._perm_mode in _PERM_CYCLE else 0
@@ -2982,6 +3024,7 @@ class VibeCLIApp(App[None]):
             prompt=prompt,
             project_path=project_path,
             permission_mode=self._perm_mode,
+            effort_mode=self._effort_mode,
             resume_session_id=resume_session_id,
         )
         if self._agent_type == "codex":
@@ -3543,6 +3586,7 @@ class VibeCLIApp(App[None]):
                 "active_project_idx": self._pm.active_idx,
                 "permission_mode":    self._perm_mode,
                 "agent_type":         self._agent_type,
+                "effort_mode":        self._effort_mode,
                 "show_files":         self._show_files,
                 "show_editor":        self._show_editor,
                 "show_terminal":      self._show_terminal,
@@ -3566,6 +3610,7 @@ class VibeCLIApp(App[None]):
         # Restore global UI flags
         self._perm_mode   = g.get("permission_mode",  self._perm_mode)
         self._agent_type  = g.get("agent_type",        self._agent_type)
+        self._effort_mode = g.get("effort_mode",       self._effort_mode)
         self._show_files  = g.get("show_files",        False)
         self._show_editor = g.get("show_editor",       False)
         self._show_terminal = g.get("show_terminal",   False)
@@ -3573,6 +3618,7 @@ class VibeCLIApp(App[None]):
 
         self.query_one("#status-bar", StatusBar).update_agent(self._agent_type)
         self.query_one("#status-bar", StatusBar).update_perm(self._perm_mode)
+        self.query_one("#status-bar", StatusBar).update_effort(self._effort_mode)
 
         # Restore detached agents
         self._detached = state.get("detached", {})

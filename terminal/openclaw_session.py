@@ -48,12 +48,19 @@ def _strip_ansi(text: str) -> str:
     return re.sub(r"\x1b\[[0-9;]*[mKHFABCDJG]", "", text)
 
 
-# Permission mode → --thinking level
+# Permission mode → --thinking level (baseline when effort_mode is "medium")
 _THINKING: dict[str, str] = {
     "plan":         "minimal",
     "safe":         "low",
     "accept_edits": "medium",
     "bypass":       "high",
+}
+
+# effort_mode → --thinking level override
+# "medium" means "use _THINKING[permission_mode]" (no override)
+_EFFORT_THINKING: dict[str, str] = {
+    "low":  "low",
+    "high": "xhigh",
 }
 
 _PLAN_PREFIX = (
@@ -117,7 +124,11 @@ class OpenClawSession(AgentSession):
             return 1
 
         # ── Build command ────────────────────────────────────────────────
-        thinking = _THINKING.get(self.permission_mode, _THINKING["accept_edits"])
+        # effort_mode overrides the permission-derived thinking level when set
+        thinking = _EFFORT_THINKING.get(
+            self.effort_mode,
+            _THINKING.get(self.permission_mode, _THINKING["accept_edits"]),
+        )
         prompt   = (_PLAN_PREFIX + self.prompt) if self.permission_mode == "plan" else self.prompt
 
         cmd = [

@@ -47,6 +47,12 @@ _PLAN_PREFIX = (
     "If you would normally make edits, describe exactly what changes you would make instead. "
 )
 
+_EFFORT_PREFIX: dict[str, str] = {
+    "low":  "Be concise. Give a brief, direct answer without extra explanation. ",
+    "high": "Think step-by-step and reason thoroughly before answering. "
+            "Consider edge cases and alternatives carefully. ",
+}
+
 
 
 class CodexSession(AgentSession):
@@ -79,7 +85,10 @@ class CodexSession(AgentSession):
         on_permission_request: Callable[[dict], None] | None = None,
     ) -> int:
         perm_flags = _PERMISSION_FLAGS.get(self.permission_mode, _PERMISSION_FLAGS["accept_edits"])
-        prompt = (_PLAN_PREFIX + self.prompt) if self.permission_mode == "plan" else self.prompt
+        prompt = self.prompt
+        if self.permission_mode == "plan":
+            prompt = _PLAN_PREFIX + prompt
+        prompt = _EFFORT_PREFIX.get(self.effort_mode, "") + prompt
         cmd = ["codex", "exec", "--json"] + perm_flags + self.extra_flags + [prompt]
 
         try:
