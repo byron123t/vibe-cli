@@ -2199,14 +2199,14 @@ class StatusBar(Static):
             extra = f"  [dim]gateway ✓  {ch}[/dim]"
         else:
             extra = "  [red]gateway ✗ — run: openclaw gateway[/red]"
-        existing = self.query_one("#sb-agent", Label).renderable or ""
+        existing = self.query_one("#sb-agent", Label).content or ""
         # Replace previous openclaw status suffix
         base = str(existing).split("  [")[0] if "  [" in str(existing) else str(existing)
         self.query_one("#sb-agent", Label).update(base + extra)
 
     def clear_openclaw_status(self) -> None:
         agent_lbl = self.query_one("#sb-agent", Label)
-        text = str(agent_lbl.renderable or "")
+        text = str(agent_lbl.content or "")
         agent_lbl.update(text.split("  [")[0] if "  [" in text else text)
 
 
