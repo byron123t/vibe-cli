@@ -64,6 +64,7 @@ from terminal.agent_session import AgentSession
 from terminal.claude_session import ClaudeSession, PERMISSION_FLAGS
 from terminal.codex_session import CodexSession
 from terminal.cursor_session import CursorSession
+from terminal.openclaw_session import OpenClawSession
 from terminal.pty_widget import PTYWidget
 from terminal.approval_server import ApprovalServer
 from claude.suggestion_engine import PromptSuggestionEngine
@@ -77,6 +78,7 @@ from memory.user_profile import UserProfile
 from memory.linter import VaultLinter
 from memory.linker import Linker
 from memory.brain_importer import BrainImporter
+from core.openclaw_gateway import GatewayClient, ChannelMessage, DeviceEvent, make_client
 
 
 # ---------------------------------------------------------------------------
@@ -581,10 +583,11 @@ class AgentWidget(Static):
 
         # Use the stored agent type — never use type(self._active_session) since
         # restored sessions are RestoredSession which returns instantly on run().
-        from terminal.claude_session import ClaudeSession
-        from terminal.codex_session  import CodexSession
-        from terminal.cursor_session import CursorSession
-        _cls_map = {"claude": ClaudeSession, "codex": CodexSession, "cursor": CursorSession}
+        from terminal.claude_session   import ClaudeSession
+        from terminal.codex_session    import CodexSession
+        from terminal.cursor_session   import CursorSession
+        from terminal.openclaw_session import OpenClawSession
+        _cls_map = {"claude": ClaudeSession, "codex": CodexSession, "cursor": CursorSession, "openclaw": OpenClawSession}
         session_cls = _cls_map.get(self._agent_type, ClaudeSession)
         continuation = session_cls(
             prompt=reply,
@@ -1886,11 +1889,134 @@ _PERM_LABELS = {
 _PERM_CYCLE = ["plan", "safe", "accept_edits", "bypass"]
 
 _AGENT_LABELS: dict[str, tuple[str, str]] = {
-    "claude": ("Claude", "$accent"),
-    "codex":  ("Codex",  "$warning"),
-    "cursor": ("Cursor", "$success"),
+    "claude":    ("Claude",    "$accent"),
+    "codex":     ("Codex",     "$warning"),
+    "cursor":    ("Cursor",    "$success"),
+    "openclaw":  ("OpenClaw",  "$error"),
 }
-_AGENT_CYCLE = ["claude", "codex", "cursor"]
+_AGENT_CYCLE = ["claude", "codex", "cursor", "openclaw"]
+
+
+class OpenClawInboxPanel(Static):
+    """
+    Sidebar panel that displays messages received from OpenClaw channels and
+    paired devices.  Hidden unless the user presses `c` (channels toggle).
+    """
+
+    DEFAULT_CSS = """
+    OpenClawInboxPanel {
+        width: 36;
+        height: 1fr;
+        background: $surface-darken-1;
+        border-left: solid $primary-darken-2;
+        overflow-y: auto;
+    }
+    .oc-header {
+        background: $primary-darken-3;
+        color: $accent;
+        padding: 0 1;
+        height: 1;
+    }
+    .oc-message {
+        padding: 0 1;
+        margin-bottom: 1;
+        border-bottom: dashed $primary-darken-2;
+    }
+    .oc-channel {
+        color: $accent;
+        text-style: bold;
+    }
+    .oc-peer {
+        color: $text-muted;
+    }
+    .oc-body {
+        color: $text;
+        margin-top: 0;
+    }
+    .oc-device {
+        color: $warning;
+        padding: 0 1;
+        margin-bottom: 0;
+    }
+    .oc-status {
+        color: $text-muted;
+        padding: 0 1;
+        text-style: italic;
+    }
+    .oc-empty {
+        color: $text-muted;
+        padding: 1 1;
+        text-style: italic;
+    }
+    """
+
+    def compose(self) -> ComposeResult:
+        yield Label(" OpenClaw Inbox", classes="oc-header")
+        yield Label("Waiting for gateway…", classes="oc-empty", id="oc-empty")
+        yield ScrollableContainer(id="oc-scroll")
+
+    # ── public API called via call_from_thread ──────────────────────────────
+
+    def add_message(self, msg: ChannelMessage) -> None:
+        """Append a ChannelMessage entry to the inbox."""
+        self._remove_empty()
+        direction = "↓" if msg.direction == "inbound" else "↑"
+        channel   = msg.display_channel or "main"
+        peer      = msg.display_peer
+        text      = msg.text[:500]   # truncate very long messages
+
+        entry = Static(
+            f"[bold $accent]{direction} {channel}[/bold $accent]"
+            f"[dim]  {peer}[/dim]\n{text}",
+            classes="oc-message",
+        )
+        try:
+            self.query_one("#oc-scroll", ScrollableContainer).mount(entry)
+            self.query_one("#oc-scroll", ScrollableContainer).scroll_end(animate=False)
+        except Exception:
+            pass
+
+    def add_device_event(self, dev: DeviceEvent) -> None:
+        """Append a device/node event notification."""
+        self._remove_empty()
+        label = Static(
+            f"[yellow]⟁ {dev.node_name}[/yellow]  {dev.event_type}",
+            classes="oc-device",
+        )
+        try:
+            self.query_one("#oc-scroll", ScrollableContainer).mount(label)
+        except Exception:
+            pass
+
+    def set_status(self, text: str) -> None:
+        """Update the status line (gateway connection state)."""
+        try:
+            existing = self.query(".oc-status")
+            for w in existing:
+                w.remove()
+            label = Static(text, classes="oc-status")
+            self.query_one("#oc-scroll", ScrollableContainer).mount(label)
+        except Exception:
+            pass
+
+    def clear(self) -> None:
+        """Clear all messages."""
+        try:
+            sc = self.query_one("#oc-scroll", ScrollableContainer)
+            for child in list(sc.children):
+                child.remove()
+        except Exception:
+            pass
+        try:
+            self.query_one("#oc-empty", Label).display = True
+        except Exception:
+            pass
+
+    def _remove_empty(self) -> None:
+        try:
+            self.query_one("#oc-empty", Label).display = False
+        except Exception:
+            pass
 
 
 class StatusBar(Static):
@@ -1924,6 +2050,23 @@ class StatusBar(Static):
         label, color = _PERM_LABELS.get(mode, ("?", "$text"))
         self.query_one("#sb-perm", Label).update(f"[{color}]{label}[/{color}]")
 
+    def update_openclaw_status(self, reachable: bool, channels: list[str]) -> None:
+        """Append gateway + channel info when OpenClaw is the active agent."""
+        if reachable:
+            ch = "  ".join(channels[:4]) if channels else "no channels"
+            extra = f"  [dim]gateway ✓  {ch}[/dim]"
+        else:
+            extra = "  [red]gateway ✗ — run: openclaw gateway[/red]"
+        existing = self.query_one("#sb-agent", Label).renderable or ""
+        # Replace previous openclaw status suffix
+        base = str(existing).split("  [")[0] if "  [" in str(existing) else str(existing)
+        self.query_one("#sb-agent", Label).update(base + extra)
+
+    def clear_openclaw_status(self) -> None:
+        agent_lbl = self.query_one("#sb-agent", Label)
+        text = str(agent_lbl.renderable or "")
+        agent_lbl.update(text.split("  [")[0] if "  [" in text else text)
+
 
 class ShortcutsBar(Static):
     """Bottom bar showing key bindings at a glance."""
@@ -1953,6 +2096,7 @@ class ShortcutsBar(Static):
         ("e",      "editor"),
         ("m",      "graph"),
         ("t",      "terminal"),
+        ("c",      "channels"),
         ("q",      "quit"),
     ]
 
@@ -2176,6 +2320,7 @@ class VibeCLIApp(App[None]):
         Binding("t",     "toggle_terminal",  "Terminal"),
         Binding("ctrl+t","toggle_terminal",  "Terminal", show=False),
         Binding("r",     "reattach_menu",    "Reattach"),
+        Binding("c",     "toggle_inbox",     "Channels"),
         Binding("B",     "import_brain",     "Import Brain"),
         Binding("s",     "save_file",        "Save"),
         Binding("escape","exit_mode",        "Back", show=False),
@@ -2221,8 +2366,13 @@ class VibeCLIApp(App[None]):
         self._show_editor   = False
         self._show_graph    = False
         self._show_terminal = False
+        self._show_inbox    = False
         self._last_command: str = ""
         self._detached: dict[str, list[dict]] = {}  # project_path → list of detached agent states
+
+        # OpenClaw Gateway client and asyncio task
+        self._gateway_client: GatewayClient | None = None
+        self._gateway_task:   asyncio.Task | None   = None
 
     # ------------------------------------------------------------------ compose
 
@@ -2236,6 +2386,7 @@ class VibeCLIApp(App[None]):
                 yield AgentPanel(id="agent-panel")
                 yield TerminalPanel(id="terminal-panel")
             yield GraphPane(self._vault, id="graph-pane")
+            yield OpenClawInboxPanel(id="inbox-panel")
         yield PromptBar(id="prompt-bar")
         yield ShortcutsBar(id="shortcuts-bar")
 
@@ -2251,6 +2402,7 @@ class VibeCLIApp(App[None]):
         self.query_one("#editor-panel").display   = False
         self.query_one("#graph-pane").display     = False
         self.query_one("#terminal-panel").display = False
+        self.query_one("#inbox-panel").display    = False
 
         active = self._pm.active
         if active:
@@ -2262,6 +2414,10 @@ class VibeCLIApp(App[None]):
 
         self.query_one("#status-bar", StatusBar).update_agent(self._agent_type)
         self.query_one("#status-bar", StatusBar).update_perm(self._perm_mode)
+
+        # If OpenClaw is the active agent, check gateway status in background
+        if self._agent_type == "openclaw":
+            self._check_openclaw_gateway()
 
         # Restore previous session (agents, layout flags, active project)
         saved = SessionStore().load()
@@ -2390,21 +2546,35 @@ class VibeCLIApp(App[None]):
     def _cycle_agent_type(self) -> None:
         idx = _AGENT_CYCLE.index(self._agent_type) if self._agent_type in _AGENT_CYCLE else 0
         self._agent_type = _AGENT_CYCLE[(idx + 1) % len(_AGENT_CYCLE)]
-        self.query_one("#status-bar", StatusBar).update_agent(self._agent_type)
+        sb = self.query_one("#status-bar", StatusBar)
+        sb.update_agent(self._agent_type)
+        sb.clear_openclaw_status()
         label, _ = _AGENT_LABELS[self._agent_type]
+
         # Check availability
         available = {
-            "claude": ClaudeSession.is_available(),
-            "codex":  CodexSession.is_available(),
-            "cursor": CursorSession.is_available(),
+            "claude":   ClaudeSession.is_available(),
+            "codex":    CodexSession.is_available(),
+            "cursor":   CursorSession.is_available(),
+            "openclaw": OpenClawSession.is_available(),
         }
-        if not available.get(self._agent_type, False):
+        if not available.get(self._agent_type, True):
             self.notify(
                 f"Agent → {label}  [dim](not installed — will show install hint on run)[/dim]",
                 timeout=4,
             )
         else:
             self.notify(f"Agent → {label}", timeout=3)
+
+        # For OpenClaw: check gateway in background and update status bar;
+        # also start the gateway client if the inbox panel is already open.
+        if self._agent_type == "openclaw":
+            self._check_openclaw_gateway()
+            if self._show_inbox:
+                self._start_gateway_client()
+        else:
+            # Switched away from OpenClaw — stop gateway client
+            self._stop_gateway_client()
 
     def _cycle_permissions(self) -> None:
         idx = _PERM_CYCLE.index(self._perm_mode) if self._perm_mode in _PERM_CYCLE else 0
@@ -2641,6 +2811,18 @@ class VibeCLIApp(App[None]):
         if self._show_terminal:
             self.query_one("#terminal-panel", TerminalPanel).focus_input()
 
+    def action_toggle_inbox(self) -> None:
+        """Toggle the OpenClaw channel inbox panel."""
+        self._show_inbox = not self._show_inbox
+        self._apply_layout()
+        if self._show_inbox:
+            # If OpenClaw is the active agent, make sure the gateway is running
+            if self._agent_type == "openclaw":
+                self._start_gateway_client()
+        else:
+            # Stop gateway when panel is closed to save resources
+            self._stop_gateway_client()
+
     def action_run_last_command(self) -> None:
         if not self._last_command:
             self.notify("No command detected yet.", timeout=2)
@@ -2672,6 +2854,7 @@ class VibeCLIApp(App[None]):
         ap    = self.query_one("#agent-panel",    AgentPanel)
         tp    = self.query_one("#terminal-panel", TerminalPanel)
         graph = self.query_one("#graph-pane",     GraphPane)
+        inbox = self.query_one("#inbox-panel",    OpenClawInboxPanel)
 
         if self._show_graph:
             fb.display    = False
@@ -2679,6 +2862,7 @@ class VibeCLIApp(App[None]):
             ap.display    = False
             tp.display    = False
             graph.display = True
+            inbox.display = False
             graph.query_one("#gp-tree", Tree).focus()
         else:
             graph.display = False
@@ -2686,6 +2870,7 @@ class VibeCLIApp(App[None]):
             ep.display    = self._show_editor
             ap.display    = True
             tp.display    = self._show_terminal
+            inbox.display = self._show_inbox
             if not self._show_editor or not ep.is_in_edit_mode:
                 ap.focus()
 
@@ -2803,6 +2988,8 @@ class VibeCLIApp(App[None]):
             return CodexSession(**kwargs)
         if self._agent_type == "cursor":
             return CursorSession(**kwargs)
+        if self._agent_type == "openclaw":
+            return OpenClawSession(**kwargs)
         return ClaudeSession(**kwargs)
 
     # ------------------------------------------------------------------ agent completion
@@ -3255,11 +3442,89 @@ class VibeCLIApp(App[None]):
                 except Exception:
                     pass
 
+    # ------------------------------------------------------------------ OpenClaw gateway
+
+    @work(thread=True)
+    def _check_openclaw_gateway(self) -> None:
+        """Background worker: ping the OpenClaw Gateway and update the status bar."""
+        from core.openclaw_config import OpenClawConfig, is_gateway_reachable, gateway_port
+        try:
+            cfg       = OpenClawConfig.load()
+            port      = gateway_port(cfg)
+            reachable = is_gateway_reachable(port)
+            channels  = cfg.channels if reachable else []
+            self.call_from_thread(
+                self.query_one("#status-bar", StatusBar).update_openclaw_status,
+                reachable,
+                channels,
+            )
+            if not reachable:
+                self.call_from_thread(
+                    self.notify,
+                    "OpenClaw Gateway is not running. "
+                    "Start it with: openclaw gateway  "
+                    "or: openclaw onboard --install-daemon",
+                    severity="warning",
+                    timeout=8,
+                )
+        except Exception:
+            pass
+
+    def _start_gateway_client(self) -> None:
+        """Start the GatewayClient as an asyncio task (no-op if already running)."""
+        if self._gateway_task and not self._gateway_task.done():
+            return   # already running
+
+        try:
+            from core.openclaw_config import OpenClawConfig, gateway_port, is_gateway_reachable
+            cfg  = OpenClawConfig.load()
+            port = gateway_port(cfg)
+            if not is_gateway_reachable(port):
+                return   # gateway not up — don't bother
+        except Exception:
+            return
+
+        client = make_client(port=port)
+
+        # Wire callbacks — all call into the UI thread via call_from_thread
+        def _on_message(msg: ChannelMessage) -> None:
+            self.call_from_thread(
+                self.query_one("#inbox-panel", OpenClawInboxPanel).add_message, msg
+            )
+
+        def _on_device(dev: DeviceEvent) -> None:
+            self.call_from_thread(
+                self.query_one("#inbox-panel", OpenClawInboxPanel).add_device_event, dev
+            )
+
+        def _on_status(text: str) -> None:
+            self.call_from_thread(
+                self.query_one("#inbox-panel", OpenClawInboxPanel).set_status, text
+            )
+
+        client.on_message      = _on_message
+        client.on_device_event = _on_device
+        client.on_status       = _on_status
+
+        self._gateway_client = client
+        # Schedule as a background asyncio task on the app's event loop
+        self._gateway_task = asyncio.ensure_future(client.run())
+
+    def _stop_gateway_client(self) -> None:
+        """Stop and clean up the GatewayClient task."""
+        if self._gateway_client:
+            self._gateway_client.stop()
+            self._gateway_client = None
+        if self._gateway_task:
+            self._gateway_task.cancel()
+            self._gateway_task = None
+
     # ------------------------------------------------------------------ session persistence
 
     def action_quit(self) -> None:
-        """Save session state, unmount SSH filesystems, then quit."""
+        """Save session state, stop gateway client, unmount SSH filesystems, then quit."""
         self._save_session()
+        self._stop_gateway_client()
         self._unmount_ssh_projects()
         self.exit()
 

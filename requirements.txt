@@ -6,3 +6,4 @@ PyYAML>=6.0
 Pillow>=10.0.0
 pyte>=0.8.0
 ptyprocess>=0.7.0
+websockets>=12.0
