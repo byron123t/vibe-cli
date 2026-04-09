@@ -166,6 +166,21 @@ python main.py --add ~/code/myapp ~/code/api
 # Or press o inside the app to open a directory picker
 ```
 
+## Manual
+
+A full man page is included covering all key bindings, slash commands, agents, permission modes, configuration options, vault layout, and more.
+
+```bash
+make install-man   # installs to /opt/homebrew/share/man/man1/
+man vibe
+```
+
+Or read it without installing:
+
+```bash
+man ./man/vibe.1
+```
+
 ## Tests
 
 ```bash

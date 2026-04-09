@@ -1,9 +1,9 @@
 PYTHON := $(shell command -v python3 || command -v python)
 PIP    := $(PYTHON) -m pip
 
-.PHONY: install run test clean
+.PHONY: install run test clean man install-man
 
-install:
+install: install-man
 	$(PIP) install --upgrade pip setuptools
 	$(PIP) install -e .
 
@@ -15,6 +15,13 @@ run:
 
 test:
 	$(PYTHON) -m pytest tests/ -v
+
+man:
+	man ./man/vibe.1
+
+install-man:
+	mkdir -p /opt/homebrew/share/man/man1
+	cp man/vibe.1 /opt/homebrew/share/man/man1/vibe.1
 
 clean:
 	find . -type d -name __pycache__ -exec rm -rf {} + 2>/dev/null; \

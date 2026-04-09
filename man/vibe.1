@@ -1,0 +1,1035 @@
+.\" vibe.1 — manual page for vibe-cli
+.\" View with:  man ./man/vibe.1
+.\"             groff -man -Tutf8 man/vibe.1 | less
+.TH VIBE 1 "April 2026" "vibe\-cli" "User Commands"
+.
+.\" =========================================================
+.SH NAME
+.\" =========================================================
+vibe \- keyboard\-first multi\-project AI coding terminal
+.
+.\" =========================================================
+.SH SYNOPSIS
+.\" =========================================================
+.B vibe
+.RB [ \-\-config
+.IR path ]
+.RB [ \-\-add
+.IR path \|.\|.\|.]
+.
+.\" =========================================================
+.SH DESCRIPTION
+.\" =========================================================
+.B vibe
+is a modal, keyboard\-first TUI for running multiple AI coding agents
+(Claude, Codex, Cursor, OpenClaw) across many projects simultaneously.
+It uses a vim\-like command/prompt/edit modal model, streams live agent
+output, manages per\-project memory vaults, and persists sessions across
+restarts.
+.PP
+The interface is divided into panels: a project tab bar at the top, an
+agent output stack in the centre, optional side panels (file browser,
+editor, memory graph, OpenClaw inbox), an embedded PTY terminal, a
+two\-row prompt bar with AI\-generated and user\-defined shortcuts, and
+a status bar showing the active agent, permission mode, effort level,
+and any session limits.
+.
+.\" =========================================================
+.SH OPTIONS
+.\" =========================================================
+.TP
+.BI \-\-config\  path
+Path to the JSON configuration file.
+Defaults to
+.I config.json
+in the current directory.
+.TP
+.BI \-\-add\  path\ [\fIpath\fR\ ...]
+Open one or more project directories on startup.
+Paths are added to the project list and the first one becomes active.
+.
+.\" =========================================================
+.SH CONFIGURATION
+.\" =========================================================
+Configuration is a JSON file.
+All keys are optional; the defaults shown below are used when omitted.
+.PP
+.nf
+{
+  "agent": {
+    "type":   "claude",      // "claude" | "codex" | "cursor" | "openclaw"
+    "effort": "medium"       // "low" | "medium" | "high"
+  },
+  "claude": {
+    "permission_mode": "accept_edits"
+                             // "plan" | "safe" | "accept_edits" | "bypass"
+  },
+  "vault": {
+    "root": "vault"          // Path to the memory vault directory
+  },
+  "git": {
+    "auto_commit": true,
+    "commit_message_prefix": "[VibeCLI] "
+  },
+  "personalization": {
+    "recency_half_life_days":   7.0,
+    "decay_interval_hours":    24,
+    "project_affinity_weight":  0.4,
+    "recency_weight":           0.35,
+    "frequency_weight":         0.25
+  }
+}
+.fi
+.
+.\" =========================================================
+.SH MODES
+.\" =========================================================
+.B vibe
+operates in three mutually exclusive input modes.
+.TP
+.B Command mode
+The default mode.
+Single\-key shortcuts are active.
+Focus rests on the agent panel.
+Exit any other mode with
+.BR Escape ,
+.BR Backspace ,
+or
+.B ,
+(when the prompt is empty).
+.TP
+.B Prompt mode
+Entered by pressing
+.B n
+or
+.BR Enter .
+The prompt input receives keyboard focus.
+Typing builds a prompt; pressing
+.B Enter
+submits it to the active agent.
+.B Tab
+cycles AI\-generated suggestions.
+.TP
+.B Edit mode
+Entered with
+.B i
+while the editor panel is visible.
+The file editor becomes writable.
+.B Escape
+saves and returns to command mode.
+.
+.\" =========================================================
+.SH KEY BINDINGS
+.\" =========================================================
+.SS Command Mode
+.TP
+.BR ] \ /\  [
+Next / previous project (wraps around).
+.TP
+.BR 1 \(en 9
+Jump to project by number.
+.TP
+.BR n \ or\  Enter
+Open the prompt input (enter Prompt mode).
+.TP
+.B o
+Open the directory picker modal to add a project (local or SSH).
+.TP
+.B x
+Cancel the last running agent.
+.TP
+.B d
+Detach the selected agent widget (saves its state for later reattachment).
+.TP
+.B r
+Open the reattach menu for detached agents in the current project.
+.TP
+.B j
+Scroll the agent panel down.
+.TP
+.B k
+Scroll the agent panel up.
+.TP
+.B f
+Toggle the file browser panel.
+.TP
+.B e
+Toggle the read\-only editor panel.
+.TP
+.B i
+Enter edit mode in the editor (editor must be visible first).
+.TP
+.B m
+Toggle the memory / knowledge graph visualisation.
+.TP
+.B t \ /\  Ctrl+t
+Toggle the embedded PTY terminal.
+.TP
+.B c
+Toggle the OpenClaw channel inbox panel.
+.TP
+.B s
+Save the current file (edit mode only).
+.TP
+.B p
+Play the file open in the editor as audio (when applicable).
+.TP
+.B Shift+A
+Cycle active agent type: Claude \(-> Codex \(-> Cursor \(-> OpenClaw.
+.TP
+.B Shift+P
+Cycle permission mode: plan \(-> safe \(-> accept_edits \(-> bypass.
+.TP
+.B Shift+E
+Cycle effort level: low \(-> medium \(-> high.
+.TP
+.B Shift+R
+Run the last shell command detected in agent output in the terminal.
+.TP
+.B Shift+B
+Open the brain/memory import modal (imports .md files into the vault).
+.TP
+.BR 1 \(en 5
+Fill AI\-generated suggestion N into the prompt input and focus it.
+.TP
+.BR 6 \(en 0
+Fill manual shortcut slot 1\(en5 (keys 6\(en9, 0) into the prompt input.
+.TP
+.B Ctrl+6 \(en Ctrl+0
+While the prompt input is focused: save the current text as manual
+shortcut for that slot.
+.TP
+.B q
+Quit.
+Saves session state and unmounts any SSH filesystems.
+.PP
+.SS Prompt Mode
+.TP
+.B Tab
+Cycle through AI\-generated suggestions (fills the input).
+.TP
+.B Enter
+Submit the prompt and launch an agent.
+.TP
+.BR Escape \ /\  Backspace \ /\  ,
+Return to command mode without submitting.
+.PP
+.SS Edit Mode
+.TP
+.B Escape
+Save the file and return to command mode.
+.PP
+.SS Permission Prompt (inline, safe / accept_edits modes)
+.TP
+.BR h \ /\  \(la
+Move selection left.
+.TP
+.BR l \ /\  \(ra
+Move selection right.
+.TP
+.B y
+Approve the pending tool call immediately.
+.TP
+.B n
+Deny the pending tool call immediately.
+.TP
+.B Enter
+Confirm the currently highlighted option (Approve / Approve+Remember / Deny).
+.
+.\" =========================================================
+.SH SLASH COMMANDS
+.\" =========================================================
+Typed into the prompt input; consumed before reaching the agent.
+Claude forwards unknown slash commands to its own CLI.
+All other agents display a warning for unknown commands.
+.TP
+.BI /effort\  [low|medium|high]
+Set or display the reasoning\-depth (effort) level.
+No argument shows the current level.
+.TP
+.BI /agent\  [claude|codex|cursor|openclaw]
+.TQ
+.BI /switch\  [claude|codex|cursor|openclaw]
+Switch the active agent.
+No argument shows the current agent.
+.TP
+.BI /perm\  [plan|safe|accept_edits|bypass]
+.TQ
+.BI /permissions\  [plan|safe|accept_edits|bypass]
+Set the permission mode.
+No argument shows the current mode.
+.TP
+.BI /model\  [provider/id]
+Override the model used for the next session (Claude and OpenClaw only).
+Example:
+.BR "/model anthropic/claude\-opus\-4\-5" .
+No argument clears the override.
+.TP
+.BI /budget\  [amount]
+Set a USD spending cap per session (Claude only).
+Accepts
+.BI $ amount
+or plain numeric.
+Example:
+.BR "/budget 2.50" .
+No argument clears the cap.
+.TP
+.BI /turns\  [n]
+.TQ
+.BI /max-turns\  [n]
+Limit the number of agentic turns per run.
+For Claude this maps to
+.BR \-\-max\-turns ;
+for Codex it maps to
+.BR \-\-attempts
+(capped 1\(en4).
+No argument clears the limit.
+.TP
+.BI /system\  [text]
+Append
+.I text
+to the system prompt for subsequent sessions (Claude only,
+via
+.BR \-\-append\-system\-prompt ).
+No argument clears the override.
+.TP
+.BI /tools\  allow\ <pattern>
+Add
+.I pattern
+to the allowed\-tools list.
+Allowed tools bypass the approval prompt.
+Comma\-separated patterns accepted.
+.TP
+.BI /tools\  deny\ <pattern>
+Add
+.I pattern
+to the disallowed\-tools list.
+Disallowed tools are removed from the agent's context entirely.
+.TP
+.BI /tools\  remove\ <pattern>
+Remove
+.I pattern
+from both lists.
+.TP
+.B /tools\ clear
+Clear both the allowed and disallowed tool lists.
+.TP
+.B /tools
+Show the current allowed and disallowed lists.
+.TP
+.BI /fork\  [instruction]
+Fork the conversation.
+For Claude this passes
+.B /fork
+to the CLI natively.
+For other agents a new session is launched prefixed with the last 20 lines
+of the previous agent's output as context, followed by
+.I instruction
+if supplied.
+.TP
+.B /clear
+Clear the agent panel.
+For Claude this passes
+.B /clear
+to the CLI natively (resets conversation history).
+For other agents all panel widgets are dismissed.
+.TP
+.B /compact
+Compact / summarise history.
+For Claude this passes
+.B /compact
+to the CLI natively.
+For other agents behaviour is identical to
+.BR /clear .
+.TP
+.B /help
+Display a summary of available slash commands.
+.PP
+Claude also accepts its own native commands as pass\-through prompts:
+.BR /init ,
+.BR /memory ,
+.BR /config ,
+.BR /review ,
+and others.
+.
+.\" =========================================================
+.SH AGENTS
+.\" =========================================================
+.SS Claude
+.B Requirements:
+.BR claude " CLI on PATH (Claude Code)"
+.PP
+The default and most capable agent.
+Runs as
+.B claude \-\-print \-\-verbose \-\-output\-format stream\-json
+and streams NDJSON events.
+Supports multi\-turn session resumption via
+.BR \-\-resume .
+.PP
+Active limits are passed as CLI flags:
+.BR \-\-model ,
+.BR \-\-max\-turns ,
+.BR \-\-max\-budget\-usd ,
+.BR \-\-append\-system\-prompt ,
+.BR \-\-allowedTools ,
+.BR \-\-disallowedTools .
+.SS Codex
+.B Requirements:
+.BR codex " CLI on PATH (@openai/codex)"
+.PP
+Runs as
+.B codex exec \-\-json
+with sandbox flags.
+.B \-\-attempts
+(1\(en4) is set from the
+.B /turns
+value.
+Does not support session resumption.
+.SS Cursor
+.B Requirements:
+.BR agent " CLI on PATH (Cursor desktop app)"
+.PP
+Runs as
+.B agent \-\-print \-\-output\-format stream\-json
+with trust/force/plan flags derived from the permission mode.
+Does not support session resumption.
+.SS OpenClaw
+.B Requirements:
+.BR openclaw " CLI on PATH; Gateway daemon running on 127.0.0.1:18789"
+.PP
+Runs as
+.B openclaw agent \-\-message \(dq...\(dq \-\-thinking <level>
+and streams plain text.
+Thinking level is derived from the permission mode and overridden by
+effort level.
+Start the daemon with:
+.nf
+
+  openclaw gateway --port 18789
+  # or permanently:
+  openclaw onboard --install-daemon
+
+.fi
+.
+.\" =========================================================
+.SH PERMISSION MODES
+.\" =========================================================
+Cycle with
+.B Shift+P
+or
+.BR "/perm <mode>" .
+The active mode is shown in the status bar.
+.TP
+.B plan
+Read\-only analysis mode.
+Claude uses
+.BR \-\-permission\-mode\ plan .
+No file writes or shell commands are executed.
+The agent describes what it
+.I would
+do instead.
+Other agents receive a planning prefix injected into their prompt.
+.TP
+.B safe
+Every tool call raises an inline
+.B PermissionPrompt
+widget that blocks agent execution until the user approves or denies.
+An HTTP hook server is installed in
+.B .claude/settings.local.json
+for Claude.
+.TP
+.B accept_edits
+File operations (Read, Write, Edit, MultiEdit, Glob, Grep, LS,
+TodoWrite, TodoRead) are silently auto\-approved.
+All other tools (Bash, WebFetch, WebSearch, etc.) still raise the
+approval prompt.
+.TP
+.B bypass
+All tool calls proceed without any permission check.
+Claude uses
+.BR \-\-dangerously\-skip\-permissions .
+Use with care.
+.
+.\" =========================================================
+.SH EFFORT LEVELS
+.\" =========================================================
+Cycle with
+.B Shift+E
+or
+.BR "/effort <level>" .
+The active level appears in the status bar (hidden at default
+.BR medium ).
+.TP
+.B low
+Fast, minimal reasoning.
+Claude receives a \(lqBe concise\(rq prefix.
+OpenClaw uses
+.BR \-\-thinking\ low .
+Codex and Cursor receive the same prefix.
+.TP
+.B medium
+Default balanced behaviour.
+No prefix is injected.
+OpenClaw thinking level is derived from the permission mode.
+.TP
+.B high
+Deep reasoning.
+Claude receives a \(lqThink step\-by\-step\(rq prefix.
+OpenClaw uses
+.BR \-\-thinking\ xhigh .
+Codex and Cursor receive the same prefix.
+.
+.\" =========================================================
+.SH PROJECTS
+.\" =========================================================
+.SS Opening projects
+.TP
+On startup:
+.B vibe \-\-add
+.I path1 path2
+.TP
+Inside the app:
+Press
+.B o
+to open the directory picker modal.
+The modal has two tabs:
+.RS
+.TP
+.B 📁 Local
+Standard filesystem tree with tab\-completion in the path input.
+.TP
+.B 🌐 Remote SSH
+Form accepting host, username (optional), port (default 22), and
+remote path.
+On submit the path is mounted via
+.B sshfs
+and added as a remote project.
+.RE
+.PP
+.SS Project storage
+Projects are persisted to
+.IR vault/user/projects.json .
+Each entry records the project name, local path, last active file,
+pinned files, and (for SSH projects) the SSH connection details.
+.PP
+.SS Project switching
+Use
+.B ]
+/
+.B [
+to cycle, or
+.BR 1 \(en 9
+to jump.
+Switching projects never cancels running agents; they continue in
+the background and their output is accessible by switching back.
+.PP
+.SS SSH / remote projects
+.B Requirements:
+.B sshfs
+must be installed.
+.PP
+Mount base:
+.IR \(ti/.vibe\-cli/mounts/ .
+Remote projects are automatically re\-mounted on startup and unmounted
+on quit (best\-effort).
+Display name includes a remote indicator, e.g.
+.IR "\(oaA myapp (host:~/path)" .
+.
+.\" =========================================================
+.SH AGENT PANEL
+.\" =========================================================
+Each project has its own scrollable stack of
+.B AgentWidget
+instances.
+Widgets are numbered sequentially (#1, #2, …).
+.PP
+While an agent is running its output streams into a live log.
+When it completes the log becomes selectable and copyable (Cmd+C / Ctrl+C).
+A reply input appears below the log for multi\-turn follow\-up (Claude only).
+.PP
+.SS Detach and reattach
+Press
+.B d
+to detach the selected agent widget.
+The widget is removed from the panel but its full state (prompt, output,
+session ID) is preserved in memory and persisted across restarts.
+.PP
+Press
+.B r
+to open the reattach menu.
+Use arrow keys or
+.BR j / k
+to navigate; Enter to reattach; D to kill.
+.
+.\" =========================================================
+.SH MEMORY VAULT
+.\" =========================================================
+Every agent run is automatically logged to the vault as a timestamped
+Obsidian\-compatible markdown note with YAML frontmatter.
+.PP
+.SS Vault layout
+.nf
+vault/
+├── _MOCs/
+│   ├── MOC - Index.md       master index
+│   ├── MOC - Projects.md
+│   └── MOC - <tag>.md       per\-tag maps of content
+├── projects/
+│   └── <project>/
+│       └── run_logs/
+│           └── YYYY\-MM\-DDThh\-mm\-ss_<slug>.md
+├── user/
+│   ├── profile.md            psychometric / coding profile
+│   ├── projects.json         project list
+│   ├── session.json          UI state
+│   ├── personalization_graph.json
+│   └── manual_shortcuts.json
+└── meta/
+    └── lint_report.md        vault linter output
+.fi
+.PP
+.SS Note format
+.nf
+---
+title: Fix auth token expiry
+type: run_log
+tags: [myapp, bugfix]
+created: 2026-04-07T14:23:00Z
+project: myapp
+agent_type: claude
+permission_mode: accept_edits
+effort_mode: medium
+---
+
+## Prompt
+Fix the auth token expiry bug
+
+## Output
+...streamed agent output...
+.fi
+.PP
+.SS Wikilinks and knowledge graph
+Notes can reference each other with
+.B [[Note Title]]
+wikilink syntax.
+A bidirectional link index is maintained automatically.
+Press
+.B m
+to browse the vault as a navigable knowledge graph.
+.PP
+.SS MOCs (Maps of Content)
+Index notes are auto\-created and updated per project and per tag.
+They list all related notes using wikilinks and serve as navigable
+entry points into the vault.
+.PP
+.SS Lint and maintenance
+After every agent run the vault linter checks for broken wikilinks,
+orphan notes, and stale MOCs.
+Issues are written to
+.IR vault/meta/lint_report.md .
+.PP
+.SS Brain import
+Press
+.B Shift+B
+(or type the path when prompted) to bulk\-import a folder of
+.B .md
+files into the vault under a
+.B brain/
+prefix.
+After import, the user profile is re\-run against the imported corpus.
+.
+.\" =========================================================
+.SH PROMPT BAR
+.\" =========================================================
+The two\-row bar at the bottom of the screen.
+.PP
+.B Row 1 — AI suggestions [1]\(en[5]
+.RS
+Auto\-generated by the personalization engine from the current project's
+history.
+Filled into the prompt input with keys
+.BR 1 \(en 5 .
+Cycled with
+.BR Tab .
+.RE
+.PP
+.B Row 2 — Manual shortcuts [6]\(en[0]
+.RS
+User\-defined prompts stored in
+.IR vault/user/manual_shortcuts.json .
+Filled with keys
+.BR 6 \(en 0 .
+.PP
+.B Assignment:
+Focus the prompt input (press
+.BR n ),
+type the desired prompt text, then press
+.B Ctrl+6
+through
+.B Ctrl+0
+to save it to the corresponding slot.
+A confirmation notification is shown.
+.RE
+.
+.\" =========================================================
+.SH STATUS BAR
+.\" =========================================================
+Displayed below the project tab bar.
+Contains the following fields left to right:
+.TP
+.B Project
+Active project name.
+.TP
+.B Agent
+Active agent type with colour indicator (blue = Claude,
+yellow = Codex, green = Cursor, red = OpenClaw).
+When OpenClaw is active also shows gateway status and configured
+channels.
+.TP
+.B Permission mode
+PLAN / SAFE / ACCEPT EDITS / BYPASS ALL, colour\-coded.
+.TP
+.B Limits
+Compact display of any active session overrides:
+.B $2.50
+(budget),
+.B 20t
+(max turns),
+.B claude\-opus
+(model),
+.B sys
+(system prompt set),
+.B +2tool
+/ \fB\-1tool\fR (allowed/disallowed tool counts).
+Hidden when all values are at their defaults.
+.TP
+.B Effort
+LOW \(bu / HIGH \(bu indicator.
+Hidden at default
+.BR medium .
+.
+.\" =========================================================
+.SH OPENCLAW INTEGRATION
+.\" =========================================================
+.SS Gateway
+The OpenClaw Gateway daemon must be running before the OpenClaw agent
+or inbox can be used:
+.PP
+.nf
+openclaw gateway --port 18789
+# or install as a background daemon:
+openclaw onboard --install-daemon
+.fi
+.PP
+vibe checks gateway reachability when you switch to the OpenClaw agent
+and shows the status in the status bar.
+.PP
+.SS Channel inbox
+Press
+.B c
+to toggle the inbox panel (right sidebar).
+When open and the OpenClaw agent is active, vibe connects to the Gateway
+WebSocket and displays:
+.PP
+.RS
+.TP
+.B Channel messages
+Inbound (↓) and outbound (↑) messages from any configured channel
+(Telegram, Discord, WhatsApp, Signal, etc.) with channel name and
+sender ID.
+.TP
+.B Device events
+Notifications and events from paired iOS, Android, or macOS nodes.
+.TP
+.B Gateway status
+Connection state shown in the panel header.
+.RE
+.PP
+The connection is managed automatically: started when the panel is
+opened with OpenClaw active; stopped when the panel is closed or the
+agent is switched.
+.PP
+.SS Thinking levels
+The
+.B \-\-thinking
+flag passed to
+.B openclaw agent
+is derived from the intersection of permission mode and effort level:
+.PP
+.TS
+allbox;
+l l l.
+Effort	Permission	Thinking
+low	any	low
+medium	plan	minimal
+medium	safe	low
+medium	accept_edits	medium
+medium	bypass	high
+high	any	xhigh
+.TE
+.
+.\" =========================================================
+.SH PERSONALIZATION ENGINE
+.\" =========================================================
+The suggestion engine ranks prompts using a weighted action\-transition
+graph.
+After every agent run the following happens in a background thread:
+.PP
+.IP 1. 4
+The prompt is recorded in the personalization graph for the active
+project.
+.IP 2.
+An LLM summary and semantic tags are generated for the run note
+(requires the Anthropic SDK to be configured).
+.IP 3.
+The run is logged to the vault.
+.IP 4.
+MOC indices are updated.
+.IP 5.
+The vault linter runs; issues are written to
+.IR vault/meta/lint_report.md .
+.IP 6.
+The global user psychometric profile is updated.
+.IP 7.
+The per\-project profile is updated.
+.IP 8.
+Next\-prompt predictions are generated and blended with graph\-based
+fallbacks.
+.IP 9.
+Up to 5 suggestions are pushed to the prompt bar.
+.
+.\" =========================================================
+.SH AUTO-COMMIT
+.\" =========================================================
+After every successful agent run, if the project is a git repository,
+vibe automatically stages all changes and commits with the message:
+.PP
+.nf
+[VibeCLI] <first 72 chars of the prompt>
+.fi
+.PP
+Disable with
+.B "git.auto_commit": false
+in
+.IR config.json .
+Customise the prefix with
+.BR git.commit_message_prefix .
+.
+.\" =========================================================
+.SH TERMINAL
+.\" =========================================================
+Press
+.B t
+to toggle the embedded PTY terminal (height 20 rows, full width).
+A real shell is spawned using
+.B ptyprocess
+and rendered via
+.B pyte
+(VT100 emulation) at 30 fps.
+.PP
+Each project has its own terminal instance; state persists when
+switching between projects.
+.PP
+When an agent emits a line that looks like a shell command (starts with
+.BR $ ),
+the command is captured.
+Press
+.B Shift+R
+in command mode to paste and run it in the terminal automatically.
+.
+.\" =========================================================
+.SH FILES
+.\" =========================================================
+.TP
+.I config.json
+Main configuration file (see
+.BR CONFIGURATION ).
+.TP
+.I vault/
+Memory vault directory (Obsidian\-compatible markdown).
+Default location relative to the working directory.
+.TP
+.I vault/user/projects.json
+Persisted project list and SSH connection details.
+.TP
+.I vault/user/session.json
+UI state snapshot restored on next startup.
+.TP
+.I vault/user/profile.md
+Automatically maintained psychometric and technical user profile.
+.TP
+.I vault/user/personalization_graph.json
+Action\-transition graph used to rank prompt suggestions.
+.TP
+.I vault/user/manual_shortcuts.json
+User\-assigned keyboard macro prompts for keys
+.BR 6 \(en 0 .
+.TP
+.I vault/meta/lint_report.md
+Vault linter report (broken links, orphans, stale MOCs).
+.TP
+.I <project>/.claude/settings.local.json
+Per\-project Claude settings.
+Written by vibe when permission modes or tool allow/deny lists are
+configured.
+.TP
+.I <project>/.cursor/cli.json
+Per\-project Cursor CLI permissions.
+Written by vibe to enforce deny rules when using the Cursor agent.
+.TP
+.I \(ti/.openclaw/openclaw.json
+OpenClaw user configuration (read by vibe to discover channels,
+model, gateway port, and auth token).
+.TP
+.I \(ti/.vibe\-cli/mounts/
+Base directory for sshfs mount points.
+.
+.\" =========================================================
+.SH ENVIRONMENT
+.\" =========================================================
+.TP
+.B ANTHROPIC_API_KEY
+Required for Claude and for the LLM\-based personalization features
+(profile analysis, run summarisation, prompt prediction).
+.TP
+.B PATH
+Must include the executables for any agent CLIs you intend to use:
+.BR claude ,
+.BR codex ,
+.BR agent
+(Cursor),
+.BR openclaw .
+.
+.\" =========================================================
+.SH EXAMPLES
+.\" =========================================================
+.SS Start with a project
+.nf
+vibe --add ~/code/myapp
+.fi
+.SS Start with multiple projects and a custom config
+.nf
+vibe --config ~/.config/vibe/config.json \\
+     --add ~/work/api ~/work/frontend ~/work/infra
+.fi
+.SS Typical workflow
+.nf
+# Press n, type a prompt, press Enter
+n
+Fix the race condition in the auth middleware
+<Enter>
+
+# While agent runs, switch to another project and start a second task
+]
+n
+Add unit tests for the payment module
+<Enter>
+
+# When both finish, switch back, review output, fork a follow-up
+[
+/fork Refactor the fix to use a proper mutex
+.fi
+.SS Override model for one session
+.nf
+/model anthropic/claude-opus-4-5
+n
+Rewrite the database schema migration
+<Enter>
+/model        # clear override after the run
+.fi
+.SS Set a spending cap and turn limit
+.nf
+/budget 1.00
+/turns 15
+n
+Generate comprehensive documentation for every public function
+<Enter>
+.fi
+.SS Save a manual shortcut
+.nf
+# Press n to focus the prompt, type the reusable text, then Ctrl+6
+n
+Run the full test suite and summarise failures
+<Ctrl+6>
+# Now pressing 6 in command mode fills this prompt instantly
+.fi
+.SS Import an Obsidian vault as brain memory
+.nf
+# Press Shift+B, enter the path when prompted
+<Shift+B>
+~/Documents/ObsidianVault
+<Enter>
+.fi
+.
+.\" =========================================================
+.SH DIAGNOSTICS
+.\" =========================================================
+.TP
+Agent not found
+Ensure the relevant CLI is installed and on
+.BR PATH :
+.BR "npm install -g @anthropic-ai/claude-code" ,
+.BR "npm install -g @openai/codex" ,
+Cursor desktop app,
+.BR "npm install -g openclaw@latest" .
+.TP
+OpenClaw gateway not reachable
+Start the daemon:
+.B "openclaw gateway --port 18789"
+or run
+.B "openclaw onboard --install-daemon"
+to keep it running in the background.
+.TP
+SSH mount fails
+Ensure
+.B sshfs
+is installed.
+On macOS:
+.BR "brew install macfuse sshfs" .
+On Linux:
+.BR "apt install sshfs" .
+.TP
+Permission prompts not appearing
+Verify the permission mode is
+.B safe
+or
+.B accept_edits
+(status bar).
+.TP
+Suggestions not updating
+Suggestions are generated in a background thread after each run.
+Wait a moment; they appear automatically.
+.TP
+Profile not updating
+The LLM\-based profiler requires
+.B ANTHROPIC_API_KEY
+to be set.
+Without it, a keyword\-based fallback is used.
+.
+.\" =========================================================
+.SH SEE ALSO
+.\" =========================================================
+.BR claude (1),
+.BR codex (1),
+.BR sshfs (1),
+.BR git (1),
+.BR python3 (1)
+.PP
+Claude Code documentation:
+.I https://docs.anthropic.com/en/docs/claude-code
+.PP
+Codex documentation:
+.I https://github.com/openai/codex
+.PP
+OpenClaw documentation:
+.I https://docs.openclaw.ai
+.
+.\" =========================================================
+.SH BUGS
+.\" =========================================================
+Please report issues at the project repository.
+.
+.\" =========================================================
+.SH AUTHOR
+.\" =========================================================
+vibe\-cli contributors.

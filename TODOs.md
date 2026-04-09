@@ -1,5 +1,5 @@
 ### TODOS
-- [ ] `man` option with details
+- [x] `man` option with details
 - [x] Memory/brain importing
 - [x] LLM-powered user profiling and prompt personalization
 - [x] Remote ssh support
