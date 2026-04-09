@@ -3568,7 +3568,7 @@ class VibeCLIApp(App[None]):
         os.makedirs(cursor_dir, exist_ok=True)
         cli_json   = os.path.join(cursor_dir, "cli.json")
         deny       = self._CURSOR_PERM_DENY.get(perm_mode, self._CURSOR_PERM_DENY["accept_edits"])
-        config     = {"version": 1, "permissions": {"allow": [], "deny": deny}}
+        config     = {"permissions": {"allow": [], "deny": deny}}
         with open(cli_json, "w") as f:
             _json.dump(config, f, indent=2)
 
