@@ -420,6 +420,49 @@ def _short_model(model: str) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Slash-command hint table — shown passively while the user types /…
+# Each entry: (command, args_hint, short_description)
+# ---------------------------------------------------------------------------
+_SLASH_HINTS: list[tuple[str, str, str]] = [
+    ("/effort",       "[low|medium|high]",                    "set reasoning depth"),
+    ("/agent",        "[claude|codex|cursor|openclaw]",       "switch agent"),
+    ("/switch",       "[claude|codex|cursor|openclaw]",       "alias for /agent"),
+    ("/perm",         "[plan|safe|accept_edits|bypass]",      "set permissions"),
+    ("/permissions",  "[plan|safe|accept_edits|bypass]",      "alias for /perm"),
+    ("/model",        "[provider/id]",                        "override model"),
+    ("/budget",       "[amount]",                             "USD spending cap (Claude)"),
+    ("/turns",        "[n]",                                  "max turns/attempts"),
+    ("/max-turns",    "[n]",                                  "alias for /turns"),
+    ("/system",       "[text]",                               "append to system prompt"),
+    ("/tools",        "allow|deny|remove|clear <pat>",        "tool access lists"),
+    ("/fork",         "[instruction]",                        "fork with previous context"),
+    ("/clear",        "",                                     "clear agent panel"),
+    ("/compact",      "",                                     "compact history"),
+    ("/help",         "",                                     "show this list"),
+]
+
+
+def _slash_hint_text(prefix: str) -> str:
+    """Return a formatted hint string for commands matching *prefix* (e.g. '/mo')."""
+    prefix_lower = prefix.lower()
+    matches = [
+        (cmd, args, desc)
+        for cmd, args, desc in _SLASH_HINTS
+        if cmd.startswith(prefix_lower)
+    ]
+    if not matches:
+        return ""
+    parts = []
+    for cmd, args, desc in matches[:6]:   # cap at 6 to avoid overflow
+        hint = f"{cmd}"
+        if args:
+            hint += f" {args}"
+        hint += f"  — {desc}"
+        parts.append(hint)
+    return "  |  ".join(parts)
+
+
+# ---------------------------------------------------------------------------
 # AgentWidget — one Claude session
 # ---------------------------------------------------------------------------
 
@@ -444,6 +487,9 @@ class AgentWidget(Static):
     AgentWidget.agent-selected {
         border: solid $accent;
     }
+    AgentWidget.agent-verbose {
+        max-height: 80;
+    }
     .agent-header {
         background: $surface;
         color: $text-muted;
@@ -456,18 +502,34 @@ class AgentWidget(Static):
         padding: 0 1;
     }
     .agent-log { height: 12; background: $background; }
+    .agent-log.agent-verbose { height: 40; }
     .agent-ta  {
         height: 12;
         background: $background;
         border: none;
         padding: 0;
     }
+    .agent-ta.agent-verbose  { height: 40; }
     .agent-status-running { color: $warning;  height: 1; padding: 0 1; }
     .agent-status-done    { color: $success;  height: 1; padding: 0 1; }
     .agent-status-error   { color: $error;    height: 1; padding: 0 1; }
     .agent-reply {
         height: 3;
         border: tall $accent-darken-2;
+        background: $surface;
+        display: none;
+    }
+    .slash-hint {
+        height: 1;
+        padding: 0 1;
+        color: $text-muted;
+        background: $surface;
+        display: none;
+    }
+    .agent-perm-indicator {
+        height: 1;
+        padding: 0 2;
+        color: $text-disabled;
         background: $surface;
         display: none;
     }
@@ -483,6 +545,7 @@ class AgentWidget(Static):
                  vault: "MemoryVault | None" = None,
                  restore: "dict | None" = None,
                  agent_type: str = "claude",
+                 verbose: bool = False,
                  **kwargs) -> None:
         super().__init__(**kwargs)
         self.session  = session          # original session — stable, never replaced
@@ -490,10 +553,14 @@ class AgentWidget(Static):
         self._vault   = vault
         self._restore = restore          # saved state dict; if set, skip running
         self._agent_type = agent_type    # "claude" | "codex" | "cursor"
+        self._verbose = verbose          # expanded output height
         self._log:    AgentLog | None = None
-        self._ta:     SelectableLog | None = None
-        self._status: Label | None = None
-        self._meta:   Label | None = None
+        self._ta:           SelectableLog | None = None
+        self._status:       Label | None = None
+        self._meta:         Label | None = None
+        self._slash_hint:   Label | None = None
+        self._perm_ind:     Label | None = None
+        self._current_perm_mode: str = session.permission_mode
         self._in_code_fence = False
         self._fence_lang    = ""
         self._full_lines:   list[str] = []   # accumulates all output for TextArea
@@ -517,22 +584,58 @@ class AgentWidget(Static):
             id=f"agent-reply-{sid}",
             classes="agent-reply",
         )
+        yield Label("", id=f"slash-hint-{sid}",   classes="slash-hint")
+        yield Label("", id=f"agent-perm-{sid}", classes="agent-perm-indicator")
         proj_name = os.path.basename(self.session.project_path.rstrip("/"))
         yield AgentMemoryWidget(self.session.prompt, self._vault,
                                 project=proj_name,
                                 id=f"agent-mem-{sid}")
 
     def on_mount(self) -> None:
-        sid          = self.session.session_id
-        self._log    = self.query_one(f"#agent-log-{sid}",    AgentLog)
-        self._ta     = self.query_one(f"#agent-ta-{sid}",     SelectableLog)
-        self._status = self.query_one(f"#agent-status-{sid}", Label)
-        self._meta   = self.query_one(f"#agent-meta-{sid}",   Label)
+        sid               = self.session.session_id
+        self._log         = self.query_one(f"#agent-log-{sid}",    AgentLog)
+        self._ta          = self.query_one(f"#agent-ta-{sid}",     SelectableLog)
+        self._status      = self.query_one(f"#agent-status-{sid}", Label)
+        self._meta        = self.query_one(f"#agent-meta-{sid}",   Label)
+        self._slash_hint  = self.query_one(f"#slash-hint-{sid}",   Label)
+        self._perm_ind    = self.query_one(f"#agent-perm-{sid}",   Label)
         self._ta.display = False          # hidden until first completion
+        # Show permission indicator immediately — visible during run and after
+        proj = os.path.basename(self.session.project_path.rstrip("/") or ".")
+        self._perm_ind.update(_perm_indicator_text(self._current_perm_mode, proj))
+        self._perm_ind.display = True
+        if self._verbose:
+            self._apply_verbose(True)
         if self._restore:
             self._restore_state()
         else:
             self._run_session()
+
+    # ------------------------------------------------------------------ verbose toggle
+
+    def toggle_verbose(self) -> None:
+        """Toggle expanded/compact output height for this agent (ctrl+o)."""
+        self._verbose = not self._verbose
+        self._apply_verbose(self._verbose)
+
+    def _apply_verbose(self, verbose: bool) -> None:
+        if verbose:
+            self.add_class("agent-verbose")
+            if self._log: self._log.add_class("agent-verbose")
+            if self._ta:  self._ta.add_class("agent-verbose")
+        else:
+            self.remove_class("agent-verbose")
+            if self._log: self._log.remove_class("agent-verbose")
+            if self._ta:  self._ta.remove_class("agent-verbose")
+
+    # ------------------------------------------------------------------ perm indicator
+
+    def update_perm_indicator(self, mode: str) -> None:
+        """Called by the app when permission mode is cycled globally."""
+        self._current_perm_mode = mode
+        if self._perm_ind is not None and self._perm_ind.display:
+            proj = os.path.basename(self.session.project_path.rstrip("/") or ".")
+            self._perm_ind.update(_perm_indicator_text(mode, proj))
 
     # ------------------------------------------------------------------ restore
 
@@ -665,11 +768,29 @@ class AgentWidget(Static):
             self._ta.display = True
             self._ta.scroll_end(animate=False)
 
-        # Show reply input
+        # Show reply input (perm indicator is already visible from on_mount)
         reply_input = self.query_one(f"#agent-reply-{sid}", Input)
         reply_input.display = True
 
         self.post_message(self.Complete(self, exit_code))
+
+    # ------------------------------------------------------------------ slash hint
+
+    @on(Input.Changed)
+    def _reply_changed(self, event: Input.Changed) -> None:
+        """Show passive slash-command hint while user types / commands."""
+        if not (event.input.id or "").startswith("agent-reply-"):
+            return
+        if self._slash_hint is None:
+            return
+        value = event.value
+        if value.startswith("/"):
+            hint = _slash_hint_text(value.split()[0] if value.split() else value)
+            if hint:
+                self._slash_hint.update(hint)
+                self._slash_hint.display = True
+                return
+        self._slash_hint.display = False
 
     # ------------------------------------------------------------------ reply / multi-turn
 
@@ -681,6 +802,17 @@ class AgentWidget(Static):
         if not reply:
             return
         event.input.value = ""
+        if self._slash_hint is not None:
+            self._slash_hint.display = False
+        # Add to shared history and clear browse state for this input
+        hist = getattr(self.app, "_prompt_history", None)
+        if hist is not None:
+            t = reply.strip()
+            if t and (not hist or hist[-1] != t):
+                hist.append(t)
+        hist_browse = getattr(self.app, "_hist_browse", None)
+        if hist_browse is not None:
+            hist_browse.pop(event.input.id, None)
         self._run_reply(reply)
 
     @work(exclusive=False)
@@ -707,7 +839,7 @@ class AgentWidget(Static):
             self._status.remove_class("agent-status-done", "agent-status-error")
             self._status.add_class("agent-status-running")
 
-        # Hide reply input while running
+        # Hide reply input while running (perm indicator stays visible)
         reply_input = self.query_one(f"#agent-reply-{sid}", Input)
         reply_input.display = False
 
@@ -724,6 +856,7 @@ class AgentWidget(Static):
             project_path=self._active_session.project_path,
             permission_mode=self._active_session.permission_mode,
             resume_session_id=self._active_session.captured_session_id,
+            verbose_output=self._verbose,
         )
         self._active_session = continuation
         self._ticker()
@@ -842,14 +975,15 @@ class AgentPanel(Static, can_focus=True):
 
     def add_agent(self, session: AgentSession,
                   vault: "MemoryVault | None" = None,
-                  agent_type: str = "claude") -> AgentWidget:
+                  agent_type: str = "claude",
+                  verbose: bool = False) -> AgentWidget:
         container = self._active_container()
         self._project_counts[self._active_project] = (
             self._project_counts.get(self._active_project, 0) + 1
         )
         count  = self._project_counts[self._active_project]
         widget = AgentWidget(session, number=count, vault=vault,
-                             agent_type=agent_type,
+                             agent_type=agent_type, verbose=verbose,
                              id=f"agent-{session.session_id}")
         container.mount(widget)
         container.scroll_end(animate=False)
@@ -1694,7 +1828,8 @@ class PromptBar(Static):
 
     DEFAULT_CSS = """
     PromptBar {
-        height: 7;
+        height: auto;
+        min-height: 7;
         background: $surface;
         border-top: solid $accent;
     }
@@ -1722,6 +1857,19 @@ class PromptBar(Static):
         padding: 0 1;
     }
     .pb-input:focus { border: tall $accent; }
+    .pb-slash-hint {
+        height: 1;
+        padding: 0 1;
+        color: $text-muted;
+        background: $surface;
+        display: none;
+    }
+    .pb-perm-indicator {
+        height: 1;
+        padding: 0 1;
+        color: $text-disabled;
+        background: $surface;
+    }
     """
 
     # [1-5] auto suggestions from the personalization engine
@@ -1755,6 +1903,8 @@ class PromptBar(Static):
         )
         inp.can_focus = False
         yield inp
+        yield Static("", id="pb-slash-hint",     classes="pb-slash-hint")
+        yield Static("", id="pb-perm-indicator", classes="pb-perm-indicator")
 
     # ── reactive watchers ────────────────────────────────────────────────────
 
@@ -1794,6 +1944,21 @@ class PromptBar(Static):
     def _input_blurred(self, _event) -> None:
         """Exclude from tab cycle as soon as focus leaves the input."""
         self.query_one("#pb-input", Input).can_focus = False
+        hint = self.query_one("#pb-slash-hint", Static)
+        hint.display = False
+
+    @on(Input.Changed, "#pb-input")
+    def _pb_input_changed(self, event: Input.Changed) -> None:
+        """Show passive slash-command hint while user types / commands."""
+        hint = self.query_one("#pb-slash-hint", Static)
+        value = event.value
+        if value.startswith("/"):
+            text = _slash_hint_text(value.split()[0] if value.split() else value)
+            if text:
+                hint.update(text)
+                hint.display = True
+                return
+        hint.display = False
 
     def fill_suggestion(self, idx: int) -> None:
         """Fill auto suggestion[idx] (0-based) into the input and focus it."""
@@ -1818,6 +1983,12 @@ class PromptBar(Static):
 
     def current_input_text(self) -> str:
         return self.query_one("#pb-input", Input).value
+
+    def update_perm_indicator(self, mode: str, project: str = "") -> None:
+        """Update the inline permission indicator below the prompt input."""
+        self.query_one("#pb-perm-indicator", Static).update(
+            _perm_indicator_text(mode, project)
+        )
 
     # ── key handling ─────────────────────────────────────────────────────────
 
@@ -1845,6 +2016,7 @@ class PromptBar(Static):
             self.post_message(PromptSubmitted(prompt))
             event.input.value = ""
             self._sugg_idx = -1
+            self.query_one("#pb-slash-hint", Static).display = False
 
 
 # ---------------------------------------------------------------------------
@@ -2119,6 +2291,22 @@ _PERM_LABELS = {
     "bypass":       ("BYPASS ALL ⚡", "$error"),
 }
 _PERM_CYCLE = ["plan", "safe", "accept_edits", "bypass"]
+
+# Compact friendly names for the inline permission indicator
+_PERM_INDICATOR_NAMES: dict[str, str] = {
+    "plan":         "plan",
+    "safe":         "safe",
+    "accept_edits": "accept edits",
+    "bypass":       "bypass all",
+}
+
+
+def _perm_indicator_text(mode: str, project: str = "") -> str:
+    """Return indicator line text, e.g. '⏵⏵ accept edits  ·  myproject'."""
+    label = _PERM_INDICATOR_NAMES.get(mode, mode)
+    proj_part = f"  ·  {project}" if project else ""
+    return f"⏵⏵ {label}{proj_part}"
+
 
 _AGENT_LABELS: dict[str, tuple[str, str]] = {
     "claude":    ("Claude",    "$accent"),
@@ -2601,8 +2789,11 @@ class VibeCLIApp(App[None]):
         Binding("c",     "toggle_inbox",     "Channels"),
         Binding("E",     "cycle_effort",        "Effort"),
         Binding("B",     "import_brain",        "Import Brain"),
-        Binding("G",     "toggle_git_commit",   "Git Auto-Commit", show=False),
-        Binding("s",     "save_file",        "Save"),
+        Binding("G",              "toggle_git_commit",     "Git Auto-Commit",             show=False),
+        Binding("V",              "toggle_verbose_default","Verbose Output (new agents)", show=False),
+        Binding("ctrl+o",         "toggle_agent_verbose",  "Expand/Collapse Output",      show=False),
+        Binding("ctrl+backslash", "cycle_permissions",     "Cycle Permission Mode",        show=False),
+        Binding("s",      "save_file",             "Save"),
         Binding("escape","exit_mode",        "Back", show=False),
         Binding("q",     "quit",             "Quit"),
     ]
@@ -2652,6 +2843,9 @@ class VibeCLIApp(App[None]):
         # PreToolUse HTTP hook server (used in "safe" permission mode)
         self._approval_server  = ApprovalServer(self._on_tool_approval_request)
 
+        # Verbose output default: new agents open with expanded log height
+        self._verbose_default: bool = False
+
         # Open-project mode: next prompt submission opens a project instead of running agent
         self._open_project_mode = False
 
@@ -2665,6 +2859,12 @@ class VibeCLIApp(App[None]):
 
         # Manual prompt shortcuts for keys [6]-[0] — 5 slots, loaded from vault
         self._manual_shortcuts: list[str] = self._load_manual_shortcuts(vault_root)
+
+        # Prompt history shared across PromptBar and all agent reply inputs.
+        # Newest entry is at the end.  Per-input browse state is tracked by
+        # input widget ID → {"idx": int, "saved": str}
+        self._prompt_history: list[str] = []
+        self._hist_browse: dict[str, dict] = {}
 
         # OpenClaw Gateway client and asyncio task
         self._gateway_client: GatewayClient | None = None
@@ -2712,6 +2912,8 @@ class VibeCLIApp(App[None]):
         self.query_one("#status-bar", StatusBar).update_perm(self._perm_mode)
         self.query_one("#status-bar", StatusBar).update_effort(self._effort_mode)
         self._refresh_limits_bar()
+        proj_name = os.path.basename(active.path.rstrip("/")) if active else ""
+        self.query_one("#prompt-bar", PromptBar).update_perm_indicator(self._perm_mode, proj_name)
 
         # If OpenClaw is the active agent, check gateway status in background
         if self._agent_type == "openclaw":
@@ -2798,6 +3000,13 @@ class VibeCLIApp(App[None]):
             event.stop()
             return
 
+        # ── up/down (while typing): browse prompt history ──────────────────
+        if in_input and key in ("up", "down") and isinstance(focused, Input):
+            self._browse_input_history(key, focused)
+            event.prevent_default()
+            event.stop()
+            return
+
         # All remaining shortcuts only apply in command mode
         if in_input or in_edit:
             return
@@ -2868,6 +3077,48 @@ class VibeCLIApp(App[None]):
         )
         self.query_one("#agent-panel", AgentPanel).focus()
 
+    # ------------------------------------------------------------------ input history
+
+    def _history_add(self, text: str) -> None:
+        """Append *text* to the shared prompt history (dedup consecutive entries)."""
+        t = text.strip()
+        if not t:
+            return
+        if self._prompt_history and self._prompt_history[-1] == t:
+            return
+        self._prompt_history.append(t)
+
+    def _browse_input_history(self, key: str, inp: "Input") -> None:
+        """Move through history for *inp* based on *key* ('up' or 'down')."""
+        iid = inp.id or ""
+        state = self._hist_browse.setdefault(iid, {"idx": -1, "saved": ""})
+        hist  = self._prompt_history
+
+        if key == "up":
+            if not hist:
+                return
+            if state["idx"] == -1:
+                state["saved"] = inp.value
+                state["idx"]   = len(hist) - 1
+            elif state["idx"] > 0:
+                state["idx"] -= 1
+            # else: already at oldest — stay there
+            inp.value = hist[state["idx"]]
+            inp.action_end()
+
+        elif key == "down":
+            if state["idx"] == -1:
+                return   # not browsing
+            if state["idx"] < len(hist) - 1:
+                state["idx"] += 1
+                inp.value = hist[state["idx"]]
+                inp.action_end()
+            else:
+                # Past newest → restore what was typed before browsing
+                state["idx"] = -1
+                inp.value    = state["saved"]
+                inp.action_end()
+
     def _cycle_agent_type(self) -> None:
         idx = _AGENT_CYCLE.index(self._agent_type) if self._agent_type in _AGENT_CYCLE else 0
         self._agent_type = _AGENT_CYCLE[(idx + 1) % len(_AGENT_CYCLE)]
@@ -2916,6 +3167,23 @@ class VibeCLIApp(App[None]):
     def action_toggle_git_commit(self) -> None:
         self._toggle_git_commit()
 
+    def action_toggle_verbose_default(self) -> None:
+        """Toggle whether new agents open in verbose (expanded) output mode."""
+        self._verbose_default = not self._verbose_default
+        state = "ON" if self._verbose_default else "OFF"
+        self.notify(f"Verbose output default: {state}  ·  applies to next agent  (ctrl+o toggles per-agent)", timeout=4)
+
+    def action_toggle_agent_verbose(self) -> None:
+        """Expand or collapse the output area of the currently selected agent (ctrl+o)."""
+        ap = self.query_one("#agent-panel", AgentPanel)
+        agent = ap.selected_agent()
+        if agent:
+            agent.toggle_verbose()
+
+    def action_cycle_permissions(self) -> None:
+        """Cycle permission mode — works from any context including agent inputs (ctrl+\\)."""
+        self._cycle_permissions()
+
     def _cycle_permissions(self) -> None:
         idx = _PERM_CYCLE.index(self._perm_mode) if self._perm_mode in _PERM_CYCLE else 0
         self._perm_mode = _PERM_CYCLE[(idx + 1) % len(_PERM_CYCLE)]
@@ -2935,6 +3203,21 @@ class VibeCLIApp(App[None]):
                     self._remove_pretooluse_hook(project.path)
             elif self._agent_type == "cursor":
                 self._write_cursor_permissions(project.path, self._perm_mode)
+
+        # Update inline permission indicators on all visible AgentWidgets and PromptBar
+        active = self._pm.active
+        proj = os.path.basename(active.path.rstrip("/")) if active else ""
+        try:
+            self.query_one("#prompt-bar", PromptBar).update_perm_indicator(
+                self._perm_mode, proj
+            )
+        except Exception:
+            pass
+        try:
+            for widget in self.query(AgentWidget):
+                widget.update_perm_indicator(self._perm_mode)
+        except Exception:
+            pass
 
         self.notify(
             f"Permission mode → {label}  "
@@ -3228,6 +3511,10 @@ class VibeCLIApp(App[None]):
             self._load_active_file(active)
             self.query_one("#file-browser",   FileBrowserPanel).set_root(active.path)
             self.query_one("#status-bar",     StatusBar).update_project(active.name)
+            proj_name = os.path.basename(active.path.rstrip("/"))
+            self.query_one("#prompt-bar", PromptBar).update_perm_indicator(
+                self._perm_mode, proj_name
+            )
         self._refresh_suggestions()
         self.query_one("#agent-panel", AgentPanel).focus()
 
@@ -3259,6 +3546,9 @@ class VibeCLIApp(App[None]):
         prompt = event.prompt.strip()
         if not prompt:
             return
+        self._history_add(prompt)
+        # Reset browse state for the PromptBar input after submission
+        self._hist_browse.pop("pb-input", None)
 
         # ── Slash commands ─────────────────────────────────────────────────
         if prompt.startswith("/"):
@@ -3309,9 +3599,10 @@ class VibeCLIApp(App[None]):
         elif self._agent_type == "cursor":
             self._write_cursor_permissions(active.path, self._perm_mode)
 
-        session = self._make_session(prompt, active.path)
+        session = self._make_session(prompt, active.path, verbose_output=self._verbose_default)
         self.query_one("#agent-panel", AgentPanel).add_agent(
-            session, vault=self._vault, agent_type=self._agent_type
+            session, vault=self._vault, agent_type=self._agent_type,
+            verbose=self._verbose_default,
         )
 
         if self._show_graph:
@@ -3325,6 +3616,7 @@ class VibeCLIApp(App[None]):
         prompt: str,
         project_path: str,
         resume_session_id: str | None = None,
+        verbose_output: bool = False,
     ) -> AgentSession:
         """Create the correct AgentSession subclass for the active agent type."""
         kwargs = dict(
@@ -3339,6 +3631,7 @@ class VibeCLIApp(App[None]):
             allowed_tools=list(self._allowed_tools),
             disallowed_tools=list(self._disallowed_tools),
             resume_session_id=resume_session_id,
+            verbose_output=verbose_output,
         )
         if self._agent_type == "codex":
             return CodexSession(**kwargs)
@@ -3879,6 +4172,15 @@ class VibeCLIApp(App[None]):
             self.query_one("#status-bar", StatusBar).update_perm(mode)
             label, _ = _PERM_LABELS[mode]
             self.notify(f"Permission → {label}", timeout=3)
+            # Refresh inline indicators
+            active = self._pm.active
+            proj = os.path.basename(active.path.rstrip("/")) if active else ""
+            try:
+                self.query_one("#prompt-bar", PromptBar).update_perm_indicator(mode, proj)
+                for widget in self.query(AgentWidget):
+                    widget.update_perm_indicator(mode)
+            except Exception:
+                pass
         elif not arg:
             label, _ = _PERM_LABELS[self._perm_mode]
             opts = " | ".join(_PERM_CYCLE)
@@ -4335,6 +4637,7 @@ class VibeCLIApp(App[None]):
             },
             "projects": projects_state,
             "detached": self._detached,
+            "prompt_history": self._prompt_history[-500:],  # cap to 500 entries
         }
         try:
             SessionStore().save(state)
@@ -4347,6 +4650,11 @@ class VibeCLIApp(App[None]):
             return
 
         g = state.get("global", {})
+
+        # Restore prompt history
+        saved_history = state.get("prompt_history", [])
+        if isinstance(saved_history, list):
+            self._prompt_history = [h for h in saved_history if isinstance(h, str)]
 
         # Restore global UI flags
         self._perm_mode   = g.get("permission_mode",  self._perm_mode)
@@ -4361,6 +4669,9 @@ class VibeCLIApp(App[None]):
         self.query_one("#status-bar", StatusBar).update_perm(self._perm_mode)
         self.query_one("#status-bar", StatusBar).update_effort(self._effort_mode)
         self._refresh_limits_bar()
+        _active_r = self._pm.active
+        _proj_r = os.path.basename(_active_r.path.rstrip("/")) if _active_r else ""
+        self.query_one("#prompt-bar", PromptBar).update_perm_indicator(self._perm_mode, _proj_r)
 
         # Restore detached agents
         self._detached = state.get("detached", {})

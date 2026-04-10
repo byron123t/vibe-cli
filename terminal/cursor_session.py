@@ -93,6 +93,8 @@ class CursorSession(AgentSession):
         cmd = ["agent", "--print", "--output-format", "stream-json"]
         if self.resume_session_id:
             cmd += ["--resume", self.resume_session_id]
+        if self.verbose_output:
+            cmd += ["--stream-partial-output"]  # stream text deltas in verbose mode
         cmd += mode_flags + self.extra_flags + [prompt]
 
         try:
@@ -158,18 +160,26 @@ class CursorSession(AgentSession):
 
         # ── tool_call started: show what the agent is doing ────────────────
         if etype == "tool_call" and event.get("subtype") == "started":
-            tc = event.get("tool_call") or {}
-            # The tool name is the first key, e.g. "shellToolCall", "editFileToolCall"
+            tc        = event.get("tool_call") or {}
             tool_key  = next(iter(tc), "")
             tool_data = tc.get(tool_key) or {}
             args      = tool_data.get("args") or {}
+            desc      = tool_data.get("description", "").strip()
+            name      = _tool_name_from_key(tool_key)
 
-            # Prefer the human-readable description if present
-            desc = tool_data.get("description", "").strip()
-            if desc:
+            if self.verbose_output:
+                lines = [f"⟳ {name}"]
+                if desc:
+                    lines.append(f"  {desc}")
+                for k, v in args.items():
+                    v_str = str(v)
+                    if len(v_str) > 200:
+                        v_str = v_str[:200] + "…"
+                    lines.append(f"  {k}: {v_str}")
+                self._emit("\n".join(lines), on_line)
+            elif desc:
                 self._emit(f"⟳ {desc[:80]}", on_line)
             else:
-                name   = _tool_name_from_key(tool_key)
                 detail = str(
                     args.get("command",
                     args.get("file_path",
@@ -178,8 +188,27 @@ class CursorSession(AgentSession):
                 self._emit(f"⟳ {name}({detail})" if detail else f"⟳ {name}", on_line)
             return
 
-        # ── tool_call completed: skip (content shown via next assistant msg) ─
+        # ── tool_call completed: show result in verbose mode ──────────────
         if etype == "tool_call" and event.get("subtype") == "completed":
+            if self.verbose_output:
+                tc        = event.get("tool_call") or {}
+                tool_key  = next(iter(tc), "")
+                tool_data = tc.get(tool_key) or {}
+                name      = _tool_name_from_key(tool_key)
+                # Result fields vary by tool — grab output/result/content/error
+                result = (
+                    tool_data.get("output")
+                    or tool_data.get("result")
+                    or tool_data.get("content")
+                    or tool_data.get("error")
+                    or ""
+                )
+                result_str = str(result).strip()
+                if result_str:
+                    lines = [f"◀ {name}"]
+                    for ln in result_str.splitlines():
+                        lines.append(f"  {ln}")
+                    self._emit("\n".join(lines), on_line)
             return
 
         # ── result: update session ID; text duplicates last assistant msg ──

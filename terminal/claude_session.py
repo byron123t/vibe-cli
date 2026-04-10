@@ -174,13 +174,52 @@ class ClaudeSession(AgentSession):
                     if text:
                         parts.append(text)
                 elif btype == "tool_use":
-                    name   = block.get("name", "?")
-                    inp    = block.get("input", {})
-                    detail = inp.get("command", inp.get("file_path", inp.get("path", "")))
-                    detail = str(detail)[:80]
-                    parts.append(f"⟳ {name}({detail})" if detail else f"⟳ {name}")
+                    name = block.get("name", "?")
+                    inp  = block.get("input", {})
+                    if self.verbose_output:
+                        # Show every input field on its own indented line
+                        lines = [f"⟳ {name}"]
+                        for k, v in inp.items():
+                            v_str = str(v)
+                            if len(v_str) > 200:
+                                v_str = v_str[:200] + "…"
+                            lines.append(f"  {k}: {v_str}")
+                        parts.append("\n".join(lines))
+                    else:
+                        detail = inp.get("command", inp.get("file_path", inp.get("path", "")))
+                        detail = str(detail)[:80]
+                        parts.append(f"⟳ {name}({detail})" if detail else f"⟳ {name}")
             if parts:
                 self._emit("\n".join(parts), on_line)
+            return
+
+        # user events carry tool_result blocks (tool outputs) — only shown in verbose mode
+        if etype == "user" and self.verbose_output:
+            msg = event.get("message", {})
+            for block in msg.get("content", []):
+                if block.get("type") != "tool_result":
+                    continue
+                tool_use_id = block.get("tool_use_id", "")
+                is_error    = block.get("is_error", False)
+                content     = block.get("content", "")
+                # content may be a string or a list of content blocks
+                if isinstance(content, list):
+                    text = "\n".join(
+                        b.get("text", "") for b in content
+                        if isinstance(b, dict) and b.get("type") == "text"
+                    ).strip()
+                else:
+                    text = str(content).strip()
+                prefix = "✗" if is_error else "◀"
+                short_id = tool_use_id[-6:] if len(tool_use_id) > 6 else tool_use_id
+                header = f"{prefix} tool_result [{short_id}]"
+                if text:
+                    result_lines = [header]
+                    for ln in text.splitlines():
+                        result_lines.append(f"  {ln}")
+                    self._emit("\n".join(result_lines), on_line)
+                else:
+                    self._emit(header, on_line)
             return
 
         if etype == "result":

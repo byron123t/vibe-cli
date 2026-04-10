@@ -153,16 +153,24 @@ class CodexSession(AgentSession):
 
         # item.completed — agent messages and finished tool runs
         if etype == "item.completed":
-            item = event.get("item") or {}
+            item  = event.get("item") or {}
             itype = item.get("type", "")
             if itype == "agent_message":
                 text = item.get("text", "").strip()
                 if text:
                     self._emit(text, on_line)
             elif itype == "command_execution":
-                output = item.get("aggregated_output", "").strip()
-                if output:
-                    for line in output.splitlines():
+                output    = item.get("aggregated_output", "")
+                exit_code = item.get("exit_code")
+                if self.verbose_output:
+                    # Verbose: emit every line verbatim, with a result header
+                    cmd = item.get("command", "")
+                    ec_str = f"  exit {exit_code}" if exit_code is not None else ""
+                    self._emit(f"◀ {cmd[:80]}{ec_str}", on_line)
+                    for ln in output.splitlines():
+                        self._emit(f"  {ln}", on_line)
+                else:
+                    for line in output.strip().splitlines():
                         stripped = line.strip()
                         if stripped:
                             self._emit(stripped, on_line)
@@ -170,11 +178,14 @@ class CodexSession(AgentSession):
 
         # item.started — show tool activity indicator
         if etype == "item.started":
-            item = event.get("item") or {}
+            item  = event.get("item") or {}
             itype = item.get("type", "")
             if itype == "command_execution":
-                cmd = item.get("command", "")[:60]
-                self._emit(f"⟳ {cmd}" if cmd else "⟳ running command…", on_line)
+                cmd = item.get("command", "")
+                if self.verbose_output:
+                    self._emit(f"⟳ {cmd}" if cmd else "⟳ running command…", on_line)
+                else:
+                    self._emit(f"⟳ {cmd[:60]}" if cmd else "⟳ running command…", on_line)
             return
 
         # turn.completed — carries session-level token usage and model name
