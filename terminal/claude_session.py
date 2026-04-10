@@ -158,6 +158,10 @@ class ClaudeSession(AgentSession):
 
         if etype == "assistant":
             msg = event.get("message", {})
+            # Capture model name from the first assistant message that reports it
+            model = msg.get("model", "")
+            if model and not self.active_model:
+                self.active_model = model
             # Accumulate per-turn token usage from each assistant message
             usage = msg.get("usage", {})
             self.output_tokens += usage.get("output_tokens", 0)

@@ -144,6 +144,9 @@ class CursorSession(AgentSession):
         # ── assistant: stream text blocks ──────────────────────────────────
         if etype in ("assistant", "message"):
             msg = event.get("message") or {}
+            model = msg.get("model", "")
+            if model and not self.active_model:
+                self.active_model = model
             content = msg.get("content") or []
             if isinstance(content, list):
                 for block in content:

@@ -102,6 +102,25 @@ class CommandDetected(Message):
 # SelectableLog — TextArea subclass that copies to the system clipboard
 # ---------------------------------------------------------------------------
 
+class AgentLog(RichLog):
+    """
+    RichLog that never captures mouse-scroll events.
+
+    _get_dispatch_methods is a generator that checks event._no_default_action
+    before yielding each MRO class's handler.  Calling event.prevent_default()
+    here stops Widget._on_mouse_scroll_down/up (which scrolls and stops the
+    event) from ever running, so the event bubbles freely to the parent
+    ScrollableContainer.  The auto-scroll from write()/scroll_end() is a
+    separate code path (scroll_to) and is unaffected.
+    """
+
+    def _on_mouse_scroll_down(self, event) -> None:  # type: ignore[override]
+        event.prevent_default()  # skip Widget handler; event still bubbles to AgentPanel
+
+    def _on_mouse_scroll_up(self, event) -> None:  # type: ignore[override]
+        event.prevent_default()  # skip Widget handler; event still bubbles to AgentPanel
+
+
 class SelectableLog(TextArea):
     """
     Read-only TextArea for agent output.
@@ -111,7 +130,26 @@ class SelectableLog(TextArea):
       1. OSC 52 terminal escape (works in iTerm2, Alacritty, tmux, …)
       2. pbcopy  fallback for macOS Terminal.app
       3. xclip   fallback for Linux
+
+    Mouse-scroll is only captured when this widget has focus (clicked or
+    tabbed into).  When unfocused, prevent_default() stops Widget's handler
+    from running so the event bubbles to the parent ScrollableContainer.
+    When focused, this handler does nothing and Widget's handler runs normally
+    via MRO, scrolling the TextArea and stopping the event.
     """
+
+    def _on_mouse_scroll_down(self, event) -> None:  # type: ignore[override]
+        if self.has_focus:
+            event.stop()           # focused: contain scroll here, never bubble to AgentPanel
+                                   # (Widget's handler still runs via MRO and scrolls the TextArea)
+        else:
+            event.prevent_default()  # unfocused: skip Widget handler; bubble to AgentPanel
+
+    def _on_mouse_scroll_up(self, event) -> None:  # type: ignore[override]
+        if self.has_focus:
+            event.stop()           # focused: contain scroll here, never bubble to AgentPanel
+        else:
+            event.prevent_default()  # unfocused: skip Widget handler; bubble to AgentPanel
 
     def action_copy(self) -> None:
         text = self.selected_text or self.text
@@ -364,6 +402,23 @@ def _fmt_elapsed(secs: float) -> str:
     return f"{m}m {s:02d}s"
 
 
+_AGENT_DISPLAY: dict[str, str] = {
+    "claude":   "Claude",
+    "codex":    "Codex",
+    "cursor":   "Cursor",
+    "openclaw": "OpenClaw",
+}
+
+
+def _short_model(model: str) -> str:
+    """Shorten a model ID for display (e.g. 'claude-sonnet-4-6' → 'sonnet-4-6')."""
+    if "/" in model:
+        model = model.split("/")[-1]
+    if model.startswith("claude-"):
+        model = model[len("claude-"):]
+    return model
+
+
 # ---------------------------------------------------------------------------
 # AgentWidget — one Claude session
 # ---------------------------------------------------------------------------
@@ -392,6 +447,11 @@ class AgentWidget(Static):
     .agent-header {
         background: $surface;
         color: $text-muted;
+        height: 1;
+        padding: 0 1;
+    }
+    .agent-meta {
+        color: $accent;
         height: 1;
         padding: 0 1;
     }
@@ -430,9 +490,10 @@ class AgentWidget(Static):
         self._vault   = vault
         self._restore = restore          # saved state dict; if set, skip running
         self._agent_type = agent_type    # "claude" | "codex" | "cursor"
-        self._log:    RichLog | None = None
+        self._log:    AgentLog | None = None
         self._ta:     SelectableLog | None = None
         self._status: Label | None = None
+        self._meta:   Label | None = None
         self._in_code_fence = False
         self._fence_lang    = ""
         self._full_lines:   list[str] = []   # accumulates all output for TextArea
@@ -442,7 +503,11 @@ class AgentWidget(Static):
         sid   = self.session.session_id
         short = self.session.prompt[:55] + ("…" if len(self.session.prompt) > 55 else "")
         yield Label(f"[bold]#{self.number}[/bold]  {short}", classes="agent-header")
-        yield RichLog(id=f"agent-log-{sid}", wrap=True, highlight=False,
+        agent_str = _AGENT_DISPLAY.get(self._agent_type, self._agent_type.title())
+        override  = self.session.model_override
+        meta_text = f"{agent_str}  ·  {_short_model(override)}" if override else agent_str
+        yield Label(meta_text, id=f"agent-meta-{sid}", classes="agent-meta")
+        yield AgentLog(id=f"agent-log-{sid}", wrap=True, highlight=False,
                       markup=False, classes="agent-log")
         yield SelectableLog("", read_only=True, id=f"agent-ta-{sid}", classes="agent-ta")
         yield Label("⟳ Running…", classes="agent-status-running",
@@ -459,9 +524,10 @@ class AgentWidget(Static):
 
     def on_mount(self) -> None:
         sid          = self.session.session_id
-        self._log    = self.query_one(f"#agent-log-{sid}",    RichLog)
+        self._log    = self.query_one(f"#agent-log-{sid}",    AgentLog)
         self._ta     = self.query_one(f"#agent-ta-{sid}",     SelectableLog)
         self._status = self.query_one(f"#agent-status-{sid}", Label)
+        self._meta   = self.query_one(f"#agent-meta-{sid}",   Label)
         self._ta.display = False          # hidden until first completion
         if self._restore:
             self._restore_state()
@@ -533,6 +599,10 @@ class AgentWidget(Static):
                     self._status.update(f"⟳ Running…  ({elapsed_str} · ↑ {tokens:,} tokens)")
                 else:
                     self._status.update(f"⟳ Running…  ({elapsed_str})")
+            # Update agent/model label once the session reports its model name
+            if self._meta and session.active_model:
+                agent_str = _AGENT_DISPLAY.get(self._agent_type, self._agent_type.title())
+                self._meta.update(f"{agent_str}  ·  {_short_model(session.active_model)}")
 
         def on_perm(request: dict) -> None:
             prompt_widget = PermissionPrompt(self, session, request)
@@ -1715,6 +1785,10 @@ class PromptBar(Static):
         inp.can_focus = True   # re-enable so .focus() succeeds; restored on blur
         inp.focus()
         self._sugg_idx = -1
+
+    def on_click(self) -> None:
+        """Clicking anywhere on the prompt bar activates the input."""
+        self.focus_input()
 
     @on(Input.Blurred, "#pb-input")
     def _input_blurred(self, _event) -> None:

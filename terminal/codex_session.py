@@ -177,6 +177,22 @@ class CodexSession(AgentSession):
                 self._emit(f"⟳ {cmd}" if cmd else "⟳ running command…", on_line)
             return
 
+        # turn.completed — carries session-level token usage and model name
+        if etype == "turn.completed":
+            usage = event.get("usage") or {}
+            # OpenAI usage keys may be output_tokens or completion_tokens
+            out = usage.get("output_tokens") or usage.get("completion_tokens") or 0
+            inp = usage.get("input_tokens")  or usage.get("prompt_tokens")    or 0
+            if out:
+                self.output_tokens = out
+            if inp:
+                self.input_tokens = inp
+            # Model may appear at top level or inside usage
+            model = event.get("model") or usage.get("model", "")
+            if model and not self.active_model:
+                self.active_model = model
+            return
+
     def cancel(self) -> None:
         if self._proc and self._proc.returncode is None:
             self._proc.terminate()
