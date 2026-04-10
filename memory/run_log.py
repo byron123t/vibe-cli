@@ -1,8 +1,32 @@
-"""RunLogger — save Claude CLI run outputs as timestamped markdown notes."""
+"""RunLogger — save agent run summaries as compact, coding-focused markdown notes.
+
+Format (single-screen, no verbose output dump):
+
+    ---
+    type: run_log
+    project: myproject
+    component: auth
+    files: [src/auth.py, src/login.py]
+    tags: [run_log, myproject, bugfix, auth, python]
+    duration_seconds: 45.2
+    created: 2026-04-10T18:34:58
+    modified: 2026-04-10T18:34:58
+    ---
+    # auth · bugfix — 2026-04-10 18:34
+
+    > Fix JWT validation in src/auth.py; token expiry check was inverted.
+
+    **Prompt:** Fix the auth bug in the login flow
+
+    **Files:** `src/auth.py` · `src/login.py`
+
+    [[myproject]]
+"""
 from __future__ import annotations
 
 import os
 import re
+from collections import Counter
 from datetime import datetime
 
 from memory.note import Note
@@ -11,7 +35,7 @@ from memory.moc import MOCManager
 
 
 # ---------------------------------------------------------------------------
-# Non-LLM helpers (always work, no API key required)
+# Tag inference tables
 # ---------------------------------------------------------------------------
 
 _LANG_KEYWORDS: list[tuple[str, str]] = [
@@ -28,7 +52,7 @@ _LANG_KEYWORDS: list[tuple[str, str]] = [
 
 _TASK_KEYWORDS: list[tuple[str, list[str]]] = [
     ("commit",   ["git commit", "git add", "commit all", "commit the"]),
-    ("bugfix",   ["fix", "bug", "error", "broken", "crash", "issue", "debug", "broken"]),
+    ("bugfix",   ["fix", "bug", "error", "broken", "crash", "issue", "debug"]),
     ("test",     ["test", "pytest", "unittest", "spec", "assert", "coverage"]),
     ("docs",     ["readme", "docstring", "documentation", "comment", "document"]),
     ("refactor", ["refactor", "clean", "restructure", "rename", "reorganize", "simplify"]),
@@ -50,55 +74,99 @@ _TOPIC_KEYWORDS: dict[str, list[str]] = {
     "deps":        ["requirements", "package.json", "dependency", "install", "upgrade", "pip "],
 }
 
+# Top-level dirs that don't indicate a component (look one level deeper)
+_SKIP_PREFIXES = frozenset({
+    "src", "lib", "app", "apps", "pkg", "internal",
+    "test", "tests", "spec", "specs", "core",
+})
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
 
 def _infer_tags(prompt: str, output: str) -> list[str]:
-    """Infer semantic tags from prompt + output without requiring an LLM."""
     text = (prompt + " " + output).lower()
     tags: list[str] = []
-
-    # 1. Language (first match wins)
     for lang, pattern in _LANG_KEYWORDS:
         if re.search(pattern, text, re.IGNORECASE):
             tags.append(lang)
             break
-
-    # 2. Task type (first match wins)
     for task_type, keywords in _TASK_KEYWORDS:
         if any(kw in text for kw in keywords):
             tags.append(task_type)
             break
-
-    # 3. Topics (up to 3)
     for topic, keywords in _TOPIC_KEYWORDS.items():
         if any(kw in text for kw in keywords) and topic not in tags:
             tags.append(topic)
         if len(tags) >= 5:
             break
-
     return tags
 
 
+def _extract_component(files: list[str], tags: list[str], project: str) -> str:
+    """Derive a short component name from file paths or topic tags."""
+    if files:
+        segs: list[str] = []
+        for f in files:
+            parts = f.replace("\\", "/").split("/")
+            stem_only = [os.path.splitext(p)[0].lower() for p in parts]
+            # Walk path segments, skip uninformative top-level dirs
+            found = ""
+            for seg in stem_only[:-1]:          # exclude filename
+                if seg not in _SKIP_PREFIXES:
+                    found = seg
+                    break
+            if not found:
+                # All dirs were skippable — use filename stem, strip test_ prefix
+                raw = stem_only[-1]
+                for pfx in ("test_", "spec_", "tests_"):
+                    if raw.startswith(pfx):
+                        raw = raw[len(pfx):]
+                        break
+                found = raw
+            segs.append(found)
+        if segs:
+            return Counter(segs).most_common(1)[0][0]
+
+    # Fall back to topic tags (auth, api, ui, …)
+    topic_set = set(_TOPIC_KEYWORDS)
+    for t in tags:
+        if t in topic_set:
+            return t
+
+    # Fall back to first task-type tag
+    task_set = {"bugfix", "feature", "refactor", "test", "docs", "config", "analysis"}
+    for t in tags:
+        if t in task_set:
+            return t
+
+    return project or "general"
+
+
 def _simple_summary(prompt: str, output: str) -> str:
-    """Extract the first meaningful line from agent output as a summary."""
-    # Strip tool-use indicators (⟳ lines) and find first real text
-    lines = output.split("\n")
+    """Extract the last substantive line from agent output."""
     candidates: list[str] = []
-    for line in lines:
-        stripped = line.strip()
-        if not stripped:
+    for line in output.split("\n"):
+        s = line.strip()
+        if not s or s.startswith("⟳") or s.startswith("```") or s.startswith("#"):
             continue
-        if stripped.startswith("⟳") or stripped.startswith("```") or stripped.startswith("#"):
-            continue
-        if len(stripped) > 25:
-            candidates.append(stripped)
-
+        if len(s) > 25:
+            candidates.append(s)
     if candidates:
-        # Take the last substantive line (agents usually summarize at the end)
-        summary = candidates[-1][:220]
-        return summary
-
-    # Fallback: truncate the prompt
+        return candidates[-1][:220]
     return f"Completed: {prompt[:120]}"
+
+
+def _fmt_duration(secs: float) -> str:
+    if secs < 60:
+        return f"{int(secs)}s"
+    m, s = divmod(int(secs), 60)
+    return f"{m}m {s:02d}s"
+
+
+def _files_line(files: list[str]) -> str:
+    return "  ·  ".join(f"`{f}`" for f in files[:8])
 
 
 # ---------------------------------------------------------------------------
@@ -107,9 +175,8 @@ def _simple_summary(prompt: str, output: str) -> str:
 
 class RunLogger:
     """
-    After each Claude CLI run, create a markdown note in:
+    After each agent run create a compact note in:
         vault/projects/<project>/run_logs/<timestamp>_<action>.md
-    and link it from the project MOC and the Run Outputs MOC.
     """
 
     def __init__(self, vault: MemoryVault, moc: MOCManager) -> None:
@@ -130,7 +197,7 @@ class RunLogger:
     ) -> Note:
         now = datetime.utcnow()
         timestamp_str = now.strftime("%Y-%m-%dT%H-%M-%S")
-        safe_action = action_id.replace(".", "_").replace("/", "_")
+        safe_action   = action_id.replace(".", "_").replace("/", "_")
         rel_path = os.path.join(
             "projects", project, "run_logs",
             f"{timestamp_str}_{safe_action}.md"
@@ -138,13 +205,12 @@ class RunLogger:
 
         self._vault.ensure_project(project)
 
-        # Summary: use LLM-provided one, or fall back to keyword extraction
         if not summary:
             summary = _simple_summary(prompt, output)
 
-        # Tags: merge base + LLM-generated + inferred (deduplicated)
-        inferred = _infer_tags(prompt, output)
-        base_tags = ["run_log", project]
+        # Merge base + LLM + inferred tags (deduplicated, order-preserved)
+        inferred   = _infer_tags(prompt, output)
+        base_tags  = ["run_log", project]
         seen: set[str] = set(base_tags)
         merged_tags = list(base_tags)
         for t in list(extra_tags or []) + inferred:
@@ -152,28 +218,43 @@ class RunLogger:
                 seen.add(t)
                 merged_tags.append(t)
 
-        files_section = ""
-        if files_modified:
-            files_section = "\n## Files Modified\n\n" + "\n".join(
-                f"- `{f}`" for f in files_modified
-            ) + "\n"
+        files = files_modified or []
+        component = _extract_component(files, merged_tags, project)
 
-        body = (
-            f"# Run: {action_label} — {now.strftime('%Y-%m-%d %H:%M')}\n\n"
-            f"## Summary\n\n{summary}\n\n"
-            f"## Prompt\n\n{prompt}\n\n"
-            f"## Output\n\n```\n{output}\n```\n"
-            f"{files_section}"
-            f"\n## Links\n\n[[{project}]]\n"
+        # Title: "{component} · {task_type} — {date}"
+        task_tag = next(
+            (t for t in merged_tags if t in {
+                "bugfix", "feature", "refactor", "test", "docs",
+                "config", "analysis", "commit",
+            }),
+            None,
         )
+        title_parts = [component]
+        if task_tag:
+            title_parts.append(task_tag)
+        note_title = " · ".join(title_parts) + f" — {now.strftime('%Y-%m-%d %H:%M')}"
+
+        # Compact body — no raw output dump
+        prompt_display = prompt[:100] + ("…" if len(prompt) > 100 else "")
+        body_parts = [
+            f"# {note_title}\n",
+            f"> {summary}\n",
+            f"\n**Prompt:** {prompt_display}\n",
+        ]
+        if files:
+            body_parts.append(f"\n**Files:** {_files_line(files)}\n")
+        body_parts.append(f"\n[[{project}]]\n")
+        body = "".join(body_parts)
 
         note = self._vault.create_note(
             rel_path=rel_path,
-            title=f"{now.strftime('%Y-%m-%d %H:%M')} {action_label}",
+            title=note_title,
             body=body,
             tags=merged_tags,
             extra_fm={
                 "project":          project,
+                "component":        component,
+                "files":            files,
                 "action":           action_id,
                 "duration_seconds": round(duration_seconds, 2),
                 "moc_topics":       [project, "run_outputs"],
@@ -181,7 +262,6 @@ class RunLogger:
             note_type="run_log",
         )
 
-        # Update MOCs
         self._moc.add_note_to_moc(note, "Run Outputs")
         if project:
             self._moc.add_note_to_moc(note, project)
@@ -190,17 +270,23 @@ class RunLogger:
         return note
 
     def get_recent_outputs(self, project: str, n: int = 5) -> list[str]:
-        """Return the last N run summaries for a project."""
+        """Return the last N run summaries for a project (handles old + new format)."""
         notes = self._vault.get_project_notes(project)
         run_logs = [no for no in notes if "run_log" in no.tags]
         run_logs.sort(key=lambda no: no.modified_at, reverse=True)
         results = []
         for note in run_logs[:n]:
             body = note.body()
-            for marker in ("## Summary", "## Output"):
-                start = body.find(marker)
-                if start >= 0:
-                    snippet = body[start + len(marker):start + 400].strip()
-                    results.append(snippet)
+            # New format: blockquote line starting with ">"
+            for line in body.splitlines():
+                s = line.strip()
+                if s.startswith("> "):
+                    results.append(s[2:].strip())
                     break
+            else:
+                # Old format: ## Summary section
+                start = body.find("## Summary")
+                if start >= 0:
+                    snippet = body[start + 10:start + 300].strip()
+                    results.append(snippet[:200])
         return results

@@ -77,6 +77,7 @@ from memory.run_log import RunLogger
 from memory.user_profile import UserProfile
 from memory.linter import VaultLinter
 from memory.linker import Linker
+from memory.compactor import Compactor
 from memory.brain_importer import BrainImporter
 from core.openclaw_gateway import GatewayClient, ChannelMessage, DeviceEvent, make_client
 
@@ -2641,7 +2642,11 @@ class BrainImportScreen(ModalScreen):
 # ---------------------------------------------------------------------------
 
 class DetachMenuScreen(ModalScreen):
-    """Modal listing detached agents — Enter to reattach, Delete to kill."""
+    """Modal listing detached agents — Enter to reattach, Delete to kill.
+
+    Actions execute in-place: the list updates immediately and the screen
+    stays open so the user can perform multiple operations before closing.
+    """
 
     DEFAULT_CSS = """
     DetachMenuScreen {
@@ -2680,9 +2685,17 @@ class DetachMenuScreen(ModalScreen):
     }
     """
 
-    def __init__(self, detached: list[dict]) -> None:
+    def __init__(
+        self,
+        detached: list[dict],
+        on_reattach: "Callable[[dict], None]",
+        on_kill: "Callable[[dict], None]",
+    ) -> None:
         super().__init__()
+        # Live reference — mutations here propagate to the app's _detached list
         self._detached = detached
+        self._on_reattach = on_reattach
+        self._on_kill = on_kill
         self._cursor: int = 0
 
     def compose(self) -> ComposeResult:
@@ -2692,12 +2705,39 @@ class DetachMenuScreen(ModalScreen):
                 yield Label("No detached agents for this project.", classes="dm-empty")
             else:
                 for i, state in enumerate(self._detached):
-                    prompt = state.get("prompt", "")[:52]
-                    agent_type = state.get("agent_type", "claude")
-                    text = f"[{i+1}]  [{agent_type}]  {prompt}"
-                    classes = "dm-item dm-item-focused" if i == 0 else "dm-item"
-                    yield Label(text, id=f"dm-item-{i}", classes=classes)
-            yield Label("↑↓/j/k=navigate  ↵=reattach  Del=kill  Esc=cancel", classes="dm-hint")
+                    yield Label(self._item_text(i, state),
+                                id=f"dm-item-{i}",
+                                classes="dm-item dm-item-focused" if i == 0 else "dm-item")
+            yield Label("↑↓/j/k=navigate  ↵=reattach  Del=kill  Esc=close", classes="dm-hint")
+
+    # ── helpers ───────────────────────────────────────────────────────────────
+
+    @staticmethod
+    def _item_text(i: int, state: dict) -> str:
+        prompt     = state.get("prompt", "")[:52]
+        agent_type = state.get("agent_type", "claude")
+        return f"[{i+1}]  [{agent_type}]  {prompt}"
+
+    def _rebuild_items(self) -> None:
+        """Remove all item labels and re-mount from the current list."""
+        for lbl in self.query(".dm-item, .dm-empty"):
+            lbl.remove()
+        container = self.query_one("#detach-menu-container")
+        hint      = self.query_one(".dm-hint")
+        if not self._detached:
+            container.mount(
+                Label("No detached agents for this project.", classes="dm-empty"),
+                before=hint,
+            )
+            self._cursor = 0
+        else:
+            self._cursor = min(self._cursor, len(self._detached) - 1)
+            for i, state in enumerate(self._detached):
+                classes = "dm-item dm-item-focused" if i == self._cursor else "dm-item"
+                container.mount(
+                    Label(self._item_text(i, state), id=f"dm-item-{i}", classes=classes),
+                    before=hint,
+                )
 
     def _move_cursor(self, delta: int) -> None:
         if not self._detached:
@@ -2710,8 +2750,24 @@ class DetachMenuScreen(ModalScreen):
         except Exception:
             pass
 
+    def _do_reattach(self) -> None:
+        if not self._detached:
+            return
+        state = self._detached.pop(self._cursor)
+        self._on_reattach(state)
+        self._rebuild_items()
+
+    def _do_kill(self) -> None:
+        if not self._detached:
+            return
+        state = self._detached.pop(self._cursor)
+        self._on_kill(state)
+        self._rebuild_items()
+
+    # ── key handling ─────────────────────────────────────────────────────────
+
     def on_key(self, event) -> None:
-        key = event.key
+        key  = event.key
         char = event.character or ""
 
         if key == "escape":
@@ -2719,23 +2775,23 @@ class DetachMenuScreen(ModalScreen):
             event.stop()
             return
 
-        if key in ("down", "arrow_down", "j"):
+        if key in ("down", "j"):
             self._move_cursor(1)
             event.stop()
             return
 
-        if key in ("up", "arrow_up", "k"):
+        if key in ("up", "k"):
             self._move_cursor(-1)
             event.stop()
             return
 
-        if key == "enter" and self._detached:
-            self.dismiss(("reattach", self._cursor))
+        if key == "enter":
+            self._do_reattach()
             event.stop()
             return
 
-        if key in ("delete", "backspace") and self._detached:
-            self.dismiss(("kill", self._cursor))
+        if key == "delete":
+            self._do_kill()
             event.stop()
             return
 
@@ -2839,6 +2895,9 @@ class VibeCLIApp(App[None]):
         self._user_profile     = UserProfile(self._vault)
         self._moc              = MOCManager(self._vault)
         self._run_logger       = RunLogger(self._vault, self._moc)
+
+        # Vault compactor — merges redundant run logs after each run
+        self._compactor        = Compactor(self._vault, self._moc)
 
         # PreToolUse HTTP hook server (used in "safe" permission mode)
         self._approval_server  = ApprovalServer(self._on_tool_approval_request)
@@ -3291,25 +3350,21 @@ class VibeCLIApp(App[None]):
         active = self._pm.active
         if active is None:
             return
-        detached = self._detached.get(active.path, [])
+        # Pass the LIVE list — the screen mutates it directly so _detached stays
+        # in sync without any dismiss callback.
+        detached_list = self._detached.setdefault(active.path, [])
 
-        def _on_result(result):
-            if result is None:
-                return
-            action, idx = result
-            detached_list = self._detached.get(active.path, [])
-            if idx >= len(detached_list):
-                return
-            if action == "kill":
-                detached_list.pop(idx)
-                self.notify("Agent killed.", timeout=2)
-            elif action == "reattach":
-                state = detached_list.pop(idx)
-                panel = self.query_one("#agent-panel", AgentPanel)
-                panel.restore_agents(active.name, [state], self._vault)
-                self.notify(f"Reattached: {state.get('prompt','')[:40]}…", timeout=3)
+        def _on_reattach(state: dict) -> None:
+            panel = self.query_one("#agent-panel", AgentPanel)
+            panel.restore_agents(active.name, [state], self._vault)
+            self._apply_layout()
+            self.notify(f"Reattached: {state.get('prompt','')[:40]}…", timeout=3)
 
-        self.push_screen(DetachMenuScreen(list(detached)), _on_result)
+        def _on_kill(state: dict) -> None:
+            prompt = state.get("prompt", "")[:40]
+            self.notify(f"Killed: {prompt}…", timeout=2)
+
+        self.push_screen(DetachMenuScreen(detached_list, _on_reattach, _on_kill))
 
     def action_import_brain(self) -> None:
         """Open the brain import modal, then run import + profiling in background."""
@@ -3713,31 +3768,35 @@ class VibeCLIApp(App[None]):
         except Exception:
             pass
 
-        # 5. Vault linter
+        # 5. Vault linter + auto-clean (delete empty notes, compact redundant logs)
         try:
             linker = Linker(self._vault)
             linter = VaultLinter(self._vault, linker)
             report = linter.run()
-            if report.has_issues:
-                lines = []
-                for src, tgt in report.broken_links:
-                    lines.append(f"- Broken link: [[{src}]] → [[{tgt}]]")
-                for t in report.orphan_notes:
-                    lines.append(f"- Orphan: {t}")
-                for t in report.stale_mocs:
+
+            # Auto-clean: remove empty notes and compact related run logs
+            deleted_empty, compacted = linter.auto_clean(self._compactor)
+
+            # Write compact lint report only when there are real structural issues
+            structural_issues = bool(report.broken_links or report.stale_mocs)
+            if structural_issues or deleted_empty or compacted:
+                from datetime import datetime as _dt
+                lines = [f"_Updated {_dt.utcnow().strftime('%Y-%m-%d %H:%M')} UTC_\n"]
+                if deleted_empty:
+                    lines.append(f"- Removed {deleted_empty} empty note(s)")
+                if compacted:
+                    lines.append(f"- Compacted {compacted} redundant run log(s)")
+                for src, tgt in report.broken_links[:20]:
+                    lines.append(f"- Broken link: `{src}` → `{tgt}`")
+                for t in report.stale_mocs[:10]:
                     lines.append(f"- Stale MOC: {t}")
-                for t in report.empty_notes:
-                    lines.append(f"- Empty note: {t}")
                 body = "\n".join(lines)
                 lint_rel = os.path.join("meta", "lint_report")
                 existing = self._vault.get_note(lint_rel)
                 if existing is None:
                     self._vault.create_note(
-                        lint_rel,
-                        title="Vault Lint Report",
-                        body=body,
-                        tags=["meta", "lint"],
-                        note_type="meta",
+                        lint_rel, title="Vault Lint Report", body=body,
+                        tags=["meta", "lint"], note_type="meta",
                     )
                 else:
                     from memory.note import FRONTMATTER_RE as _FM_RE

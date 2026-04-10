@@ -40,6 +40,13 @@ class MemoryVault:
     def save_note(self, note: Note) -> None:
         note.save()
 
+    def delete_note(self, note: Note) -> None:
+        """Delete a note's file from disk (silently ignores missing files)."""
+        try:
+            os.remove(note.path)
+        except FileNotFoundError:
+            pass
+
     # ------------------------------------------------------------------ search
 
     def all_notes(self) -> list[Note]:
