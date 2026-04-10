@@ -10,10 +10,23 @@
 - [x] More support for agent commands (claude-native command format) /fork, /effort, etc.)
 - [x] More support for parameters (max $, model, session id, etc.)
 - [x] Tests for cursor and codex
+- [ ] Test on Linux, Windows, Rasp Pi
+- [ ] Configurable git auto push
+- [ ] Full Obsidian support
+- [ ] Better project memory format
 - [ ] Updated screenshots and screen recording gifs
 - [ ] Support and tests for agent orchestration (/agents)
 - [ ] Support and tests for tooling
+- [ ] Testing on clean dev environment with no dependencies
+- [ ] Testing with openclaw
 - [ ] Proper package shipping to node and/or pip
+- [ ] Test and record with some throwaway project ideas (pokemon swap, obsidian self growing brain, meta glasses diy sdk, meta glasses stream scraping, aaru clone, zenslop)
+- [ ] Record examples speedrun timer comparison (claude code CLI, codex, cursor agents)
+- [ ] Website, vibecli.io
+- [ ] Word of mouth reach out to friends, acquaintances, slack, etc.
+- [ ] Cold DM popular twitter and linkedin posters
+- [ ] Self promo on reddit, twitter, LinkedIn, youtube
+- [ ] Run limited targeted ads
 
 ### Refs
 - [https://code.claude.com/docs/en/cli-reference](https://code.claude.com/docs/en/cli-reference)
