@@ -488,6 +488,14 @@ class AgentWidget(Static):
 
     @work(exclusive=False)
     async def _run_session(self) -> None:
+        # Hide the reply input while the initial session runs so that
+        # _find_running_agent() can correctly identify this widget as running
+        # (it checks reply.display == False; _mark_complete re-shows it when done).
+        sid = self.session.session_id
+        try:
+            self.query_one(f"#agent-reply-{sid}", Input).display = False
+        except Exception:
+            pass
         exit_code = await self._stream(self.session)
         self._mark_complete(exit_code)
 
@@ -2464,8 +2472,9 @@ class VibeCLIApp(App[None]):
         Binding("ctrl+t","toggle_terminal",  "Terminal", show=False),
         Binding("r",     "reattach_menu",    "Reattach"),
         Binding("c",     "toggle_inbox",     "Channels"),
-        Binding("E",     "cycle_effort",     "Effort"),
-        Binding("B",     "import_brain",     "Import Brain"),
+        Binding("E",     "cycle_effort",        "Effort"),
+        Binding("B",     "import_brain",        "Import Brain"),
+        Binding("G",     "toggle_git_commit",   "Git Auto-Commit", show=False),
         Binding("s",     "save_file",        "Save"),
         Binding("escape","exit_mode",        "Back", show=False),
         Binding("q",     "quit",             "Quit"),
@@ -2484,7 +2493,7 @@ class VibeCLIApp(App[None]):
         self._pers   = PersonalizationGraph(pers_path)
         self._sugg   = PromptSuggestionEngine(self._pers)
 
-        self._auto_commit    = config.get("git", {}).get("auto_commit", True)
+        self._auto_commit    = config.get("git", {}).get("auto_commit", False)
         self._commit_prefix  = config.get("git", {}).get("commit_message_prefix", "[VibeCLI] ")
 
         # Agent type: "claude" | "codex" | "cursor"
@@ -2719,6 +2728,12 @@ class VibeCLIApp(App[None]):
             event.stop()
             return
 
+        # ── G (shift+g): toggle git auto-commit+push ──────────────────────
+        if char == "G":
+            self._toggle_git_commit()
+            event.stop()
+            return
+
     # ------------------------------------------------------------------ actions
 
     # ------------------------------------------------------------------ helpers
@@ -2771,6 +2786,14 @@ class VibeCLIApp(App[None]):
         self.query_one("#status-bar", StatusBar).update_effort(self._effort_mode)
         label, _ = _EFFORT_LABELS[self._effort_mode]
         self.notify(f"Effort → {label}", timeout=3)
+
+    def _toggle_git_commit(self) -> None:
+        self._auto_commit = not self._auto_commit
+        state = "ON" if self._auto_commit else "OFF"
+        self.notify(f"Git auto-commit+push: {state}", timeout=3)
+
+    def action_toggle_git_commit(self) -> None:
+        self._toggle_git_commit()
 
     def _cycle_permissions(self) -> None:
         idx = _PERM_CYCLE.index(self._perm_mode) if self._perm_mode in _PERM_CYCLE else 0
@@ -3583,6 +3606,13 @@ class VibeCLIApp(App[None]):
                                capture_output=True, text=True, timeout=15)
             if r.returncode == 0:
                 self.call_from_thread(self.notify, f"Committed: {msg[:50]}", timeout=3)
+                p = subprocess.run(["git", "-C", project_path, "push"],
+                                   capture_output=True, text=True, timeout=30)
+                if p.returncode == 0:
+                    self.call_from_thread(self.notify, "Pushed to remote", timeout=3)
+                else:
+                    err = p.stderr.strip().splitlines()[-1] if p.stderr.strip() else "push failed"
+                    self.call_from_thread(self.notify, f"Push failed: {err}", severity="warning", timeout=5)
         except Exception:
             pass
 
@@ -4136,6 +4166,14 @@ class VibeCLIApp(App[None]):
         self._save_session()
         self._stop_gateway_client()
         self._unmount_ssh_projects()
+        # Remove the PreToolUse hook from every open project so that subsequent
+        # Claude Code sessions in those directories are not blocked by a stale
+        # hook URL pointing to this (now-dead) approval server.
+        for project in self._pm.projects:
+            try:
+                self._remove_pretooluse_hook(project.path)
+            except Exception:
+                pass
         self.exit()
 
     def _save_session(self) -> None:

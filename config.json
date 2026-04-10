@@ -11,7 +11,7 @@
     "root": "vault"
   },
   "git": {
-    "auto_commit": true,
+    "auto_commit": false,
     "commit_message_prefix": "[VibeCLI] "
   },
   "ui": {

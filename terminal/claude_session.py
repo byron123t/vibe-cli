@@ -116,6 +116,7 @@ class ClaudeSession(AgentSession):
                 stdin=asyncio.subprocess.DEVNULL,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.STDOUT,
+                limit=8 * 1024 * 1024,  # 8 MB — default 64 KB overflows on large JSON lines
             )
             assert self._proc.stdout is not None
             async for raw_line in self._proc.stdout:
