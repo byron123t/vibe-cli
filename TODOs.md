@@ -10,14 +10,16 @@
 - [x] More support for agent commands (claude-native command format) /fork, /effort, etc.)
 - [x] More support for parameters (max $, model, session id, etc.)
 - [x] Tests for cursor and codex
-- [ ] Test on Linux, Windows, Rasp Pi
-- [ ] Configurable git auto push
+- [ ] Add in tests for installing and running the app on Linux, Windows, Rasp Pi.
+- [ ] Add in support for verbose output (globally configured with shortcut not in bottom bar but in keys list from command palette, and set-able with ctrl+o at agent level)
+- [x] Configurable git auto push
+- [ ] Add in token count printing and a time elapsed indicator to all of the agents that updates every second. Similar to this UI  · Shenaniganing… (1m 46s · ↑ 342 tokens · thought for 33s).
 - [ ] Full Obsidian support
 - [ ] Better project memory format
 - [ ] Updated screenshots and screen recording gifs
 - [ ] Support and tests for agent orchestration (/agents)
 - [ ] Support and tests for tooling
-- [ ] Testing on clean dev environment with no dependencies
+- [ ] Add in tests for deploying on a clean dev environment with no dependencies.
 - [ ] Testing with openclaw
 - [ ] Proper package shipping to node and/or pip
 - [ ] Test and record with some throwaway project ideas (pokemon swap, obsidian self growing brain, meta glasses diy sdk, meta glasses stream scraping, aaru clone, zenslop)

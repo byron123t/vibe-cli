@@ -46,6 +46,7 @@ vibe-cli is modal — like vim. Press a key to act, not to type.
 | `s` | Save file (edit mode only) |
 | `A` | Cycle agent type (Claude → Codex → Cursor) |
 | `P` | Cycle permission mode (Safe → Accept Edits → Bypass) |
+| `G` | Toggle git auto-commit+push on/off |
 | `o` | Open a project directory (file picker) |
 | `Backspace` / `,` | Back to command mode |
 | `q` | Quit |
@@ -114,13 +115,15 @@ In Safe mode, a compact inline prompt appears whenever Claude wants to use a too
 
 Press `t` to open a full PTY shell (pyte + ptyprocess) — the same as a VS Code terminal, not a fake input box. Each project gets its own persistent terminal session. Press `ctrl+t` or `Escape` to close.
 
-### Auto-commit
+### Auto-commit+push
 
-When an agent finishes successfully in a git repo, changes are auto-staged and committed:
+Disabled by default. Press `G` in command mode to toggle on/off at runtime.
+
+When enabled, after each successful agent run in a git repo, vibe-cli stages all changes, commits, and pushes:
 ```
-[vibe-cli] <your prompt>
+[VibeCLI] <your prompt>
 ```
-Disable with `"git": { "auto_commit": false }` in `config.json`.
+Customise the prefix with `"git": { "commit_message_prefix": "[VibeCLI] " }` in `config.json`. To enable permanently, set `"git": { "auto_commit": true }` in `config.json`.
 
 ### Predictive suggestions
 

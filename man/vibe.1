@@ -189,6 +189,11 @@ Run the last shell command detected in agent output in the terminal.
 .B Shift+B
 Open the brain/memory import modal (imports .md files into the vault).
 .TP
+.B Shift+G
+Toggle git auto\-commit+push on or off at runtime.
+A notification confirms the new state.
+Disabled by default.
+.TP
 .BR 1 \(en 5
 Fill AI\-generated suggestion N into the prompt input and focus it.
 .TP
@@ -801,18 +806,29 @@ Up to 5 suggestions are pushed to the prompt bar.
 .\" =========================================================
 .SH AUTO-COMMIT
 .\" =========================================================
-After every successful agent run, if the project is a git repository,
-vibe automatically stages all changes and commits with the message:
+Git auto\-commit+push is
+.B disabled by default.
+Toggle it at runtime with
+.B Shift+G
+in command mode.
+A notification confirms the current state.
+.PP
+When enabled, after every successful agent run in a git repository,
+vibe stages all changes and commits with the message:
 .PP
 .nf
 [VibeCLI] <first 72 chars of the prompt>
 .fi
 .PP
-Disable with
-.B "git.auto_commit": false
+If the commit succeeds, vibe also runs
+.B git push
+and notifies on success or warns on failure.
+.PP
+To enable permanently, set
+.B "git.auto_commit": true
 in
 .IR config.json .
-Customise the prefix with
+Customise the commit message prefix with
 .BR git.commit_message_prefix .
 .
 .\" =========================================================

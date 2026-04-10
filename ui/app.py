@@ -342,10 +342,13 @@ class PermissionPrompt(Static, can_focus=True):
         rid    = self._request.get("request_id", "")
         inp    = self._request.get("tool_input", {})
         detail = (inp.get("command") or inp.get("file_path") or inp.get("path") or "")[:80]
-        self.remove()
+        # Post the Decision BEFORE removing.  Textual messages bubble through
+        # self.parent; if the removal is processed first, self.parent becomes
+        # None and the Decision never reaches VibeCLIApp._permission_decision.
         self.post_message(
             self.Decision(self._agent, self._session, rid, tool, detail, allow, always)
         )
+        self.remove()
 
 
 # ---------------------------------------------------------------------------
@@ -2728,12 +2731,6 @@ class VibeCLIApp(App[None]):
             event.stop()
             return
 
-        # ── G (shift+g): toggle git auto-commit+push ──────────────────────
-        if char == "G":
-            self._toggle_git_commit()
-            event.stop()
-            return
-
     # ------------------------------------------------------------------ actions
 
     # ------------------------------------------------------------------ helpers
@@ -3490,11 +3487,26 @@ class VibeCLIApp(App[None]):
             "tool_input": tool_input,
             "request_id": request_id,
         }
-        prompt_widget = PermissionPrompt(agent, agent.session, request)
-        if agent._status:
-            agent.mount(prompt_widget, before=agent._status)
-        else:
-            agent.mount(prompt_widget)
+
+        # call_later schedules the mount on the next Textual event-loop iteration.
+        # _on_tool_approval_request is called synchronously from an asyncio
+        # callback (ApprovalServer._handle), which is outside Textual's normal
+        # message-handler context.  Deferring via call_later ensures Textual
+        # processes the DOM change correctly while _handle is already suspended
+        # at `await event.wait()`.
+        def _do_mount() -> None:
+            try:
+                prompt_widget = PermissionPrompt(agent, agent.session, request)
+                if agent._status:
+                    agent.mount(prompt_widget, before=agent._status)
+                else:
+                    agent.mount(prompt_widget)
+            except Exception as exc:
+                self._approval_server.respond(
+                    request_id, allow=False, reason=f"Prompt mount error: {exc}"
+                )
+
+        self.call_later(_do_mount)
 
     def _find_running_agent(self) -> "AgentWidget | None":
         """Return the most recently mounted AgentWidget (active project) that has not finished."""
