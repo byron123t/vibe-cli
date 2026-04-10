@@ -13,9 +13,12 @@
 - [ ] Add in tests for installing and running the app on Linux, Windows, Rasp Pi.
 - [ ] Add in support for verbose output (globally configured with shortcut not in bottom bar but in keys list from command palette, and set-able with ctrl+o at agent level)
 - [x] Configurable git auto push
-- [ ] Add in token count printing and a time elapsed indicator to all of the agents that updates every second. Similar to this UI  · Shenaniganing… (1m 46s · ↑ 342 tokens · thought for 33s).
+- [ ] Fix plan mode toggle so that when you are in an agent input you can change the permission and it will update. All agents should display what mode they are in, with a lighter colored text under the input "  ⏵⏵ accept edits on . Cycling permissions while on an agent should use a ctrl command (not ctrl+p, maybe ctrl+shift+p? or something that doesn't conflict with terminal commands or existing commands)
+- [x] Add in token count printing and a time elapsed indicator to all of the agents that updates every second. Similar to this UI  · Shenaniganing… (1m 46s · ↑ 342 tokens · thought for 33s).
+- [ ] Add in support for / slash command autosuggestion. It should not complete on tab or enter or anything. It's just so the user knows what commands there are.
 - [ ] Full Obsidian support
 - [ ] Better project memory format
+- [ ] Fix the issue with permission request going offscreen and needing to scroll down.
 - [ ] Updated screenshots and screen recording gifs
 - [ ] Support and tests for agent orchestration (/agents)
 - [ ] Support and tests for tooling

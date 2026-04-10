@@ -157,8 +157,13 @@ class ClaudeSession(AgentSession):
             return
 
         if etype == "assistant":
+            msg = event.get("message", {})
+            # Accumulate per-turn token usage from each assistant message
+            usage = msg.get("usage", {})
+            self.output_tokens += usage.get("output_tokens", 0)
+            self.input_tokens  += usage.get("input_tokens",  0)
             parts: list[str] = []
-            for block in event.get("message", {}).get("content", []):
+            for block in msg.get("content", []):
                 btype = block.get("type", "")
                 if btype == "text":
                     text = block.get("text", "").strip()
@@ -178,6 +183,11 @@ class ClaudeSession(AgentSession):
             sid = event.get("session_id")
             if sid:
                 self.captured_session_id = sid
+            # The result event carries authoritative session-total usage
+            usage = event.get("usage", {})
+            if usage:
+                self.output_tokens = usage.get("output_tokens", self.output_tokens)
+                self.input_tokens  = usage.get("input_tokens",  self.input_tokens)
             result = event.get("result", "").strip()
             if result:
                 self._emit(result, on_line)

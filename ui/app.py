@@ -352,6 +352,19 @@ class PermissionPrompt(Static, can_focus=True):
 
 
 # ---------------------------------------------------------------------------
+# AgentWidget helpers
+# ---------------------------------------------------------------------------
+
+def _fmt_elapsed(secs: float) -> str:
+    """Return a compact human-readable elapsed-time string (e.g. '42s', '1m 06s')."""
+    s = int(secs)
+    if s < 60:
+        return f"{s}s"
+    m, s = divmod(s, 60)
+    return f"{m}m {s:02d}s"
+
+
+# ---------------------------------------------------------------------------
 # AgentWidget — one Claude session
 # ---------------------------------------------------------------------------
 
@@ -499,6 +512,7 @@ class AgentWidget(Static):
             self.query_one(f"#agent-reply-{sid}", Input).display = False
         except Exception:
             pass
+        self._ticker()
         exit_code = await self._stream(self.session)
         self._mark_complete(exit_code)
 
@@ -511,6 +525,14 @@ class AgentWidget(Static):
             cmd = self._check_for_command(line)
             if cmd:
                 self.post_message(CommandDetected(cmd))
+            # Refresh elapsed + token count on every output line
+            if self._status:
+                elapsed_str = _fmt_elapsed(session.elapsed)
+                tokens = session.output_tokens
+                if tokens:
+                    self._status.update(f"⟳ Running…  ({elapsed_str} · ↑ {tokens:,} tokens)")
+                else:
+                    self._status.update(f"⟳ Running…  ({elapsed_str})")
 
         def on_perm(request: dict) -> None:
             prompt_widget = PermissionPrompt(self, session, request)
@@ -519,6 +541,27 @@ class AgentWidget(Static):
 
         return await session.run(on_line=append, on_permission_request=on_perm)
 
+    # ------------------------------------------------------------------ live status ticker
+
+    @work(exclusive=False)
+    async def _ticker(self) -> None:
+        """Tick once per second while a session is running; self-terminates when done."""
+        import asyncio as _asyncio
+        session = self._active_session   # capture the session we're ticking for
+        while True:
+            await _asyncio.sleep(1.0)
+            # Stop if the session finished or a newer session replaced it
+            if session.is_done or self._active_session is not session:
+                break
+            if self._status is None:
+                break
+            elapsed_str = _fmt_elapsed(session.elapsed)
+            tokens = session.output_tokens
+            if tokens:
+                self._status.update(f"⟳ Running…  ({elapsed_str} · ↑ {tokens:,} tokens)")
+            else:
+                self._status.update(f"⟳ Running…  ({elapsed_str})")
+
     # ------------------------------------------------------------------ completion
 
     def _mark_complete(self, exit_code: int, restored: bool = False) -> None:
@@ -526,7 +569,13 @@ class AgentWidget(Static):
 
         if self._status:
             if exit_code == 0:
-                suffix = "restored" if restored else f"{self._active_session.elapsed:.1f}s"
+                if restored:
+                    suffix = "restored"
+                else:
+                    elapsed_str = _fmt_elapsed(self._active_session.elapsed)
+                    tokens = self._active_session.output_tokens
+                    token_str = f" · ↑ {tokens:,} tokens" if tokens else ""
+                    suffix = f"{elapsed_str}{token_str}"
                 self._status.update(f"✓ Done  ({suffix})")
                 self._status.remove_class("agent-status-running")
                 self._status.add_class("agent-status-done")
@@ -607,6 +656,7 @@ class AgentWidget(Static):
             resume_session_id=self._active_session.captured_session_id,
         )
         self._active_session = continuation
+        self._ticker()
 
         exit_code = await self._stream(continuation)
         self._mark_complete(exit_code)
