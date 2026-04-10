@@ -3977,6 +3977,12 @@ class VibeCLIApp(App[None]):
                     agent.mount(prompt_widget, before=agent._status)
                 else:
                     agent.mount(prompt_widget)
+                # Scroll the prompt into view without stealing focus or
+                # jumping — scroll_visible moves the nearest scrollable
+                # ancestor just enough to reveal the widget.
+                self.call_later(
+                    lambda: prompt_widget.scroll_visible(animate=False)
+                )
             except Exception as exc:
                 self._approval_server.respond(
                     request_id, allow=False, reason=f"Prompt mount error: {exc}"
