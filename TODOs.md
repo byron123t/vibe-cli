@@ -20,9 +20,12 @@
 - [x] Add in token count printing and a time elapsed indicator to all of the agents that updates every second. Similar to this UI  · Shenaniganing… (1m 46s · ↑ 342 tokens · thought for 33s).
 - [x] Add in support for / slash command autosuggestion. It should not complete on tab or enter or anything. It's just so the user knows what commands there are.
 - [x] You should be able to click on the new agent prompt input bar to focus on it.
-- [ ] Full Obsidian support
+- [x] Full Obsidian support
 - [x] Better project memory format
-- [ ] Fix the issue with permission request going offscreen and needing to scroll down.
+- [x] Fix the issue with permission request going offscreen and needing to scroll down.
+- [ ] Editor diffs and syntax highlighting
+- [ ] 
+- [ ] Add in support for queueing follow-up prompts to agent sessions.
 - [ ] Updated screenshots and screen recording gifs
 - [ ] Support and tests for agent orchestration (/agents)
 - [ ] Support and tests for tooling

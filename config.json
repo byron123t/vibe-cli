@@ -27,5 +27,8 @@
     "project_affinity_weight": 0.4,
     "recency_weight": 0.35,
     "frequency_weight": 0.25
+  },
+  "obsidian": {
+    "vault_path": "/Users/bjaytang/Documents/obsidiancopy"
   }
 }

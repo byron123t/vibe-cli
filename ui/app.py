@@ -4,7 +4,6 @@ Modes
 ─────
   Command mode  (default)  — single key shortcuts, no typing
   Prompt mode              — typing a prompt for a new agent  (n or Enter)
-  Edit mode                — typing in the file editor        (i to enter)
 
 Command mode keys
 ─────────────────
@@ -14,13 +13,12 @@ Command mode keys
   x             cancel last running agent
   d             close / dismiss last agent widget
   j / k         scroll agent list down / up
-  e             toggle editor panel (read-only view)
-  i             enter file edit mode  (only when editor is visible)
+  e             toggle editor panel
+  s             save current file  (when editor is open)
   p             play audio file  (when editor shows a supported audio file)
   m             toggle memory / knowledge graph
   t             toggle terminal panel (show/hide, or focus when open)
   r             run last detected shell command in terminal
-  s             save file  (only in edit mode)
   q             quit
   Escape / Backspace / ,   back to command mode
 
@@ -30,11 +28,6 @@ Prompt mode  (Input focused)
   Tab           cycle through suggestions
   Enter         submit → launch Claude agent
   Escape / ,    back to command mode  (comma only when Input is empty)
-
-Edit mode  (TextArea focused, editable)
-────────────────────────────────────────
-  type freely   edits the file
-  Escape        save + back to command mode
 """
 from __future__ import annotations
 
@@ -43,8 +36,9 @@ import os
 import re
 import subprocess
 import sys
+import threading
 from pathlib import Path
-from typing import ClassVar
+from typing import Callable, ClassVar
 
 from textual.app import App, ComposeResult
 from textual.binding import Binding
@@ -52,7 +46,6 @@ from textual.containers import Horizontal, ScrollableContainer, Container, Verti
 from textual.events import Key
 from textual.message import Message
 from textual.reactive import reactive
-from textual.screen import ModalScreen
 from textual.widgets import (
     Button, DirectoryTree, Footer, Input, Label, RichLog, Static, TextArea, Tree,
 )
@@ -79,7 +72,38 @@ from memory.linter import VaultLinter
 from memory.linker import Linker
 from memory.compactor import Compactor
 from memory.brain_importer import BrainImporter
+from memory.obsidian import ObsidianVault, ObsidianLinker
 from core.openclaw_gateway import GatewayClient, ChannelMessage, DeviceEvent, make_client
+
+from ui.themes import CUSTOM_THEMES as _CUSTOM_THEMES, APP_TO_PYGMENTS_THEME as _APP_TO_PYGMENTS_THEME
+from ui.linting import (
+    LintIssue,
+    lint_file as _lint_file,
+    LINTABLE_EXTS as _LINTABLE_EXTS,
+    language_for as _language_for,
+    set_ta_language as _set_ta_language,
+)
+from ui.constants import (
+    AGENT_DISPLAY as _AGENT_DISPLAY,
+    SLASH_HINTS as _SLASH_HINTS,
+    slash_hint_text as _slash_hint_text,
+    AUDIO_EXTS as _AUDIO_EXTS,
+    PERM_LABELS as _PERM_LABELS,
+    PERM_CYCLE as _PERM_CYCLE,
+    PERM_INDICATOR_NAMES as _PERM_INDICATOR_NAMES,
+    perm_indicator_text as _perm_indicator_text,
+    AGENT_LABELS as _AGENT_LABELS,
+    AGENT_CYCLE as _AGENT_CYCLE,
+    EFFORT_LABELS as _EFFORT_LABELS,
+    EFFORT_CYCLE as _EFFORT_CYCLE,
+)
+from ui.screens import (
+    DirectoryPickerScreen,
+    BrainImportScreen,
+    DetachMenuScreen,
+    _ObsidianPathScreen,
+    CommandPaletteScreen,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -403,14 +427,6 @@ def _fmt_elapsed(secs: float) -> str:
     return f"{m}m {s:02d}s"
 
 
-_AGENT_DISPLAY: dict[str, str] = {
-    "claude":   "Claude",
-    "codex":    "Codex",
-    "cursor":   "Cursor",
-    "openclaw": "OpenClaw",
-}
-
-
 def _short_model(model: str) -> str:
     """Shorten a model ID for display (e.g. 'claude-sonnet-4-6' → 'sonnet-4-6')."""
     if "/" in model:
@@ -418,49 +434,6 @@ def _short_model(model: str) -> str:
     if model.startswith("claude-"):
         model = model[len("claude-"):]
     return model
-
-
-# ---------------------------------------------------------------------------
-# Slash-command hint table — shown passively while the user types /…
-# Each entry: (command, args_hint, short_description)
-# ---------------------------------------------------------------------------
-_SLASH_HINTS: list[tuple[str, str, str]] = [
-    ("/effort",       "[low|medium|high]",                    "set reasoning depth"),
-    ("/agent",        "[claude|codex|cursor|openclaw]",       "switch agent"),
-    ("/switch",       "[claude|codex|cursor|openclaw]",       "alias for /agent"),
-    ("/perm",         "[plan|safe|accept_edits|bypass]",      "set permissions"),
-    ("/permissions",  "[plan|safe|accept_edits|bypass]",      "alias for /perm"),
-    ("/model",        "[provider/id]",                        "override model"),
-    ("/budget",       "[amount]",                             "USD spending cap (Claude)"),
-    ("/turns",        "[n]",                                  "max turns/attempts"),
-    ("/max-turns",    "[n]",                                  "alias for /turns"),
-    ("/system",       "[text]",                               "append to system prompt"),
-    ("/tools",        "allow|deny|remove|clear <pat>",        "tool access lists"),
-    ("/fork",         "[instruction]",                        "fork with previous context"),
-    ("/clear",        "",                                     "clear agent panel"),
-    ("/compact",      "",                                     "compact history"),
-    ("/help",         "",                                     "show this list"),
-]
-
-
-def _slash_hint_text(prefix: str) -> str:
-    """Return a formatted hint string for commands matching *prefix* (e.g. '/mo')."""
-    prefix_lower = prefix.lower()
-    matches = [
-        (cmd, args, desc)
-        for cmd, args, desc in _SLASH_HINTS
-        if cmd.startswith(prefix_lower)
-    ]
-    if not matches:
-        return ""
-    parts = []
-    for cmd, args, desc in matches[:6]:   # cap at 6 to avoid overflow
-        hint = f"{cmd}"
-        if args:
-            hint += f" {args}"
-        hint += f"  — {desc}"
-        parts.append(hint)
-    return "  |  ".join(parts)
 
 
 # ---------------------------------------------------------------------------
@@ -1294,10 +1267,7 @@ class FileBrowserPanel(Static):
 # EditorPanel
 # ---------------------------------------------------------------------------
 
-# Extensions treated as audio: show metadata + sidecar notes instead of raw bytes.
-_AUDIO_EXTS = frozenset({
-    ".mp3", ".wav", ".flac", ".m4a", ".aac", ".ogg", ".opus", ".webm", ".wma",
-})
+# _AUDIO_EXTS imported from ui.constants
 
 
 def _is_audio_file(path: str) -> bool:
@@ -1360,7 +1330,7 @@ def _audio_meta_line(path: str) -> str:
 
 
 class EditorPanel(Static):
-    """Read-only file viewer; press i to enter edit mode.
+    """Read-only file viewer.
 
     Audio files open an annotator: timestamped notes live in a sidecar
     ``<name>.vibe-annotate.txt`` next to the file. Command mode ``p`` plays
@@ -1386,104 +1356,216 @@ class EditorPanel(Static):
         color: $text-muted;
         padding: 0 1;
     }
-    .ep-area { height: 1fr; }
+    /* read-only syntax-highlighted view */
+    #ep-scroll { height: 1fr; overflow-y: auto; }
+    #ep-view   { width: 1fr; }
+    /* audio annotation TextArea */
+    #ep-area   { height: 1fr; }
+    .ep-lint {
+        height: auto;
+        max-height: 8;
+        background: $surface;
+        border-top: solid $error-darken-2;
+        padding: 0 1;
+        overflow-y: auto;
+    }
     """
 
     def __init__(self, **kwargs) -> None:
         super().__init__(**kwargs)
         self._current_path = ""
-        self._audio_mode = False
+        self._audio_mode   = False
+        self._in_view_mode = False  # True = Rich Syntax shown; False = TextArea shown
 
     def compose(self) -> ComposeResult:
         with Vertical():
-            yield Label(" (no file)  [dim]e=close · i=edit[/dim]",
+            yield Label(" (no file)  [dim]e=close[/dim]",
                         id="ep-label", classes="ep-header")
             yield Static("", id="ep-audio-meta", classes="ep-audio-meta")
-            yield TextArea("", id="ep-area", classes="ep-area",
-                           read_only=True, show_line_numbers=True)
+            # Read-only view — Rich Syntax rendered by Pygments (works on all Python versions)
+            with ScrollableContainer(id="ep-scroll"):
+                yield Static("", id="ep-view", markup=False)
+            # Audio annotation TextArea (shown only for audio files)
+            yield TextArea("", id="ep-area", read_only=False, show_line_numbers=True)
+            yield Static("", id="ep-lint", classes="ep-lint")
 
     def on_mount(self) -> None:
         self.query_one("#ep-audio-meta", Static).display = False
+        self.query_one("#ep-lint",       Static).display = False
+        self.query_one("#ep-area",     TextArea).display = False
+
+    # ------------------------------------------------------------------ load
 
     def load_file(self, path: str) -> None:
         self._current_path = path
-        self._audio_mode = _is_audio_file(path)
-        label = self.query_one("#ep-label", Label)
-        meta = self.query_one("#ep-audio-meta", Static)
-        ta = self.query_one("#ep-area", TextArea)
+        self._audio_mode   = _is_audio_file(path)
+        label = self.query_one("#ep-label",     Label)
+        meta  = self.query_one("#ep-audio-meta", Static)
+        ta    = self.query_one("#ep-area",       TextArea)
+        sc    = self.query_one("#ep-scroll",     ScrollableContainer)
 
         if self._audio_mode:
             meta.display = True
             meta.update(_audio_meta_line(path))
             label.update(
                 f" {os.path.basename(path)}  "
-                "[dim]audio · i=edit notes · p=play · e=close[/dim]"
+                "[dim]audio · p=play · e=close[/dim]"
             )
             ann = _audio_annotation_path(path)
             try:
-                if os.path.isfile(ann):
-                    content = Path(ann).read_text(encoding="utf-8", errors="replace")
-                else:
-                    content = (
-                        "# Audio notes (plain text)\n"
-                        "# Use timestamps like 0:42 or 1:23:05 — one line per cue.\n\n"
-                    )
+                content = (
+                    Path(ann).read_text(encoding="utf-8", errors="replace")
+                    if os.path.isfile(ann)
+                    else "# Audio notes (plain text)\n"
+                         "# Use timestamps like 0:42 or 1:23:05 — one line per cue.\n\n"
+                )
             except Exception as e:
                 content = f"[Error loading notes: {e}]"
-            ta.language = "markdown"
+            # Audio annotation: editable TextArea
             ta.load_text(content)
+            ta.read_only = False
+            sc.display = False
+            ta.display = True
         else:
             meta.display = False
             meta.update("")
-            label.update(f" {os.path.basename(path)}  [dim](read-only · i=edit)[/dim]")
+            label.update(
+                f" {os.path.basename(path)}  [dim]s=save · Esc=view · e=close[/dim]"
+            )
             try:
                 content = Path(path).read_text(errors="replace")
             except Exception as e:
                 content = f"[Error: {e}]"
-            ta.language = _language_for(path)
             ta.load_text(content)
-        ta.read_only = True
+            _set_ta_language(ta, _language_for(path))
+            ta.read_only = False
+            sc.display = False
+            ta.display = True
+            self._in_view_mode = False
 
-    def enter_edit_mode(self) -> None:
-        ta = self.query_one("#ep-area", TextArea)
-        ta.read_only = False
-        ta.focus()
-        label = self.query_one("#ep-label", Label)
-        base = os.path.basename(self._current_path)
-        if self._audio_mode:
-            label.update(
-                f" {base}  [bold yellow]EDIT NOTES[/bold yellow]  "
-                "[dim](Escape=save+exit)[/dim]"
-            )
-        else:
-            label.update(
-                f" {base}  [bold yellow]EDIT[/bold yellow]  "
-                "[dim](Escape=save+exit)[/dim]"
-            )
-
-    def exit_edit_mode(self) -> None:
-        ta = self.query_one("#ep-area", TextArea)
-        ta.read_only = True
-        label = self.query_one("#ep-label", Label)
-        base = os.path.basename(self._current_path)
-        if self._audio_mode:
-            label.update(
-                f" {base}  [dim]audio · i=edit notes · p=play · e=close[/dim]"
-            )
-        else:
-            label.update(f" {base}  [dim](read-only · i=edit)[/dim]")
-        self.save()
+        self._start_lint()
 
     def save(self) -> bool:
         if not self._current_path:
             return False
-        ta = self.query_one("#ep-area", TextArea)
+        ta     = self.query_one("#ep-area", TextArea)
         target = _audio_annotation_path(self._current_path) if self._audio_mode else self._current_path
         try:
             Path(target).write_text(ta.text, encoding="utf-8")
+            self._start_lint()
             return True
         except Exception:
             return False
+
+    # ------------------------------------------------------------------ syntax view
+
+    def _render_to_view(self, content: str) -> None:
+        """Render *content* into the read-only Rich Syntax pane."""
+        from rich.syntax import Syntax
+        view = self.query_one("#ep-view", Static)
+        lang = _language_for(self._current_path)
+        if lang:
+            try:
+                syn = Syntax(
+                    content, lang,
+                    theme=self._pygments_theme(),
+                    line_numbers=True,
+                    word_wrap=False,
+                    indent_guides=True,
+                )
+                view.update(syn)
+                return
+            except Exception:
+                pass
+        # Fallback: plain text (escape markup so Rich doesn't interpret it)
+        from rich.text import Text
+        view.update(Text(content))
+
+    def _pygments_theme(self) -> str:
+        """Return a Pygments style name that matches the current app theme."""
+        app_theme = getattr(self.app, "theme", "textual-dark")
+        return _APP_TO_PYGMENTS_THEME.get(app_theme, "monokai")
+
+    def switch_to_view_mode(self) -> None:
+        """Save content and display the colorized Rich Syntax read-only view."""
+        ta  = self.query_one("#ep-area",   TextArea)
+        sc  = self.query_one("#ep-scroll", ScrollableContainer)
+        self._render_to_view(ta.text)
+        ta.display = False
+        sc.display = True
+        self._in_view_mode = True
+        if self._current_path:
+            label = self.query_one("#ep-label", Label)
+            label.update(
+                f" {os.path.basename(self._current_path)}  "
+                "[dim]e=close[/dim]"
+            )
+
+    def enter_edit_mode(self) -> None:
+        """Switch from the colorized view back to the editable TextArea."""
+        ta  = self.query_one("#ep-area",   TextArea)
+        sc  = self.query_one("#ep-scroll", ScrollableContainer)
+        sc.display = False
+        ta.display = True
+        self._in_view_mode = False
+        if self._current_path:
+            label = self.query_one("#ep-label", Label)
+            label.update(
+                f" {os.path.basename(self._current_path)}  "
+                "[dim]s=save · Esc=view · e=close[/dim]"
+            )
+        ta.focus()
+
+    # ------------------------------------------------------------------ linting
+
+    def _start_lint(self) -> None:
+        """Kick off a background lint run if the current file is lintable."""
+        if not self._current_path or self._audio_mode:
+            return
+        if Path(self._current_path).suffix.lower() not in _LINTABLE_EXTS:
+            self.query_one("#ep-lint", Static).display = False
+            return
+        path = self._current_path
+
+        def _run() -> None:
+            try:
+                issues = _lint_file(path)
+            except Exception:
+                issues = []
+            self.call_from_thread(self._display_lint, path, issues)
+
+        threading.Thread(target=_run, daemon=True).start()
+
+    def _display_lint(self, path: str, issues: list[LintIssue]) -> None:
+        """Render lint results; called on the main thread via call_from_thread."""
+        # Guard: file may have changed since the lint started
+        if path != self._current_path:
+            return
+        lint_bar = self.query_one("#ep-lint", Static)
+        if not issues:
+            lint_bar.display = False
+            return
+
+        errors   = [i for i in issues if i.severity == "error"]
+        warnings = [i for i in issues if i.severity == "warning"]
+
+        parts: list[str] = []
+        if errors:
+            parts.append(f"[bold red]{len(errors)} error{'s' if len(errors) != 1 else ''}[/bold red]")
+        if warnings:
+            parts.append(f"[bold yellow]{len(warnings)} warning{'s' if len(warnings) != 1 else ''}[/bold yellow]")
+        lines = ["  ".join(parts)]
+
+        for issue in issues[:8]:
+            color = "red" if issue.severity == "error" else "yellow"
+            loc = f"L{issue.line}" + (f":{issue.col}" if issue.col else "")
+            lines.append(f"  [{color}]{loc}[/{color}]  {issue.message}")
+
+        if len(issues) > 8:
+            lines.append(f"  [dim]… {len(issues) - 8} more issue(s)[/dim]")
+
+        lint_bar.update("\n".join(lines))
+        lint_bar.display = True
 
     def try_play_audio(self) -> bool:
         """If the current file is audio, spawn a system player. Returns True if handled."""
@@ -1528,11 +1610,6 @@ class EditorPanel(Static):
             return True
         self.app.notify(f"Playing {os.path.basename(path)}", title="Audio", timeout=2)
         return True
-
-    @property
-    def is_in_edit_mode(self) -> bool:
-        ta = self.query_one("#ep-area", TextArea)
-        return not ta.read_only
 
     @property
     def current_path(self) -> str:
@@ -2020,309 +2097,16 @@ class PromptBar(Static):
             self.query_one("#pb-slash-hint", Static).display = False
 
 
-# ---------------------------------------------------------------------------
-# DirectoryPickerScreen — modal for picking a project directory
-# ---------------------------------------------------------------------------
-
-class DirectoryPickerScreen(ModalScreen):
-    """Modal overlay: navigate the filesystem and open a directory as a project.
-
-    Tab bar at the top toggles between local filesystem picker and Remote SSH form.
-    Dismisses with:
-      str                         — local directory path
-      {"path": ..., "ssh_info": ...}  — SSH-mounted project
-      None                        — cancelled
-    """
-
-    DEFAULT_CSS = """
-    DirectoryPickerScreen {
-        align: center middle;
-    }
-    #dp-container {
-        width: 72;
-        height: 40;
-        border: thick $accent;
-        background: $surface;
-        padding: 1 2;
-    }
-    #dp-tabs    { height: 3; margin-bottom: 1; }
-    .dp-tab     { width: 16; background: $surface; color: $text-muted; }
-    .dp-tab-active { background: $accent-darken-2; color: $text; }
-    #dp-header  { height: 1; color: $text-muted; }
-    #dp-tree    { height: 1fr; border: solid $primary-darken-2; margin: 1 0; }
-    #dp-input   { height: 3; border: tall $accent; }
-    #dp-footer  { height: 1; color: $text-muted; }
-    #dp-ssh-pane { height: 1fr; }
-    .dp-ssh-label { color: $text-muted; margin-top: 1; height: 1; }
-    .dp-ssh-input { margin-bottom: 0; border: tall $primary-darken-2; }
-    #dp-ssh-hint  { color: $text-muted; margin-top: 1; }
-    """
-
-    BINDINGS = [
-        Binding("escape",    "cancel", "Cancel", show=False),
-        Binding("backspace", "cancel", "Cancel", show=False),
-    ]
-
-    def __init__(self, start_path: str | None = None, **kwargs) -> None:
-        super().__init__(**kwargs)
-        self._tree_root  = os.path.expanduser("~")
-        self._input_init = start_path or self._tree_root
-        self._ssh_mode   = False   # False = local, True = SSH
-
-    def compose(self) -> ComposeResult:
-        with Container(id="dp-container"):
-            with Horizontal(id="dp-tabs"):
-                yield Button("📁 Local",      id="dp-tab-local", classes="dp-tab dp-tab-active")
-                yield Button("🌐 Remote SSH", id="dp-tab-ssh",   classes="dp-tab")
-
-            # ── Local pane ────────────────────────────────────────────────
-            with Container(id="dp-local-pane"):
-                yield Label(
-                    " OPEN PROJECT  [dim]↑↓ tree · Enter = open · type path · Escape = cancel[/dim]",
-                    id="dp-header",
-                )
-                yield DirectoryTree(self._tree_root, id="dp-tree")
-                yield Input(
-                    value=self._input_init,
-                    placeholder="type a path to jump the tree there…",
-                    id="dp-input",
-                )
-                yield Label(
-                    " Tab = focus tree · Enter in input = open · paths update as you type",
-                    id="dp-footer",
-                )
-
-            # ── SSH pane (hidden by default) ──────────────────────────────
-            with Container(id="dp-ssh-pane"):
-                yield Label("Host (e.g. myserver.com or 192.168.1.1):", classes="dp-ssh-label")
-                yield Input(placeholder="hostname or IP", id="dp-ssh-host", classes="dp-ssh-input")
-                yield Label("Username (leave blank to use default):", classes="dp-ssh-label")
-                yield Input(placeholder="user", id="dp-ssh-user", classes="dp-ssh-input")
-                yield Label("Port (default 22):", classes="dp-ssh-label")
-                yield Input(placeholder="22", id="dp-ssh-port", classes="dp-ssh-input")
-                yield Label("Remote path:", classes="dp-ssh-label")
-                yield Input(placeholder="~/projects/myapp", id="dp-ssh-path", classes="dp-ssh-input")
-                yield Label(
-                    "↵ = mount & open  ·  requires sshfs  ·  Esc = cancel",
-                    id="dp-ssh-hint",
-                )
-
-    def on_mount(self) -> None:
-        self.query_one("#dp-ssh-pane").display = False
-        self.query_one("#dp-tree", DirectoryTree).focus()
-
-    # ── Tab switching ─────────────────────────────────────────────────────
-
-    def on_button_pressed(self, event: Button.Pressed) -> None:
-        bid = event.button.id
-        if bid == "dp-tab-local":
-            self._set_mode(ssh=False)
-        elif bid == "dp-tab-ssh":
-            self._set_mode(ssh=True)
-
-    def _set_mode(self, ssh: bool) -> None:
-        self._ssh_mode = ssh
-        self.query_one("#dp-local-pane").display = not ssh
-        self.query_one("#dp-ssh-pane").display   = ssh
-        self.query_one("#dp-tab-local").set_class(not ssh, "dp-tab-active")
-        self.query_one("#dp-tab-ssh").set_class(ssh,      "dp-tab-active")
-        if ssh:
-            self.query_one("#dp-ssh-host", Input).focus()
-        else:
-            self.query_one("#dp-tree", DirectoryTree).focus()
-
-    # ── Local tree handlers ───────────────────────────────────────────────
-
-    @on(Tree.NodeHighlighted, "#dp-tree")
-    def _node_highlighted(self, event: Tree.NodeHighlighted) -> None:
-        data = event.node.data
-        if data is not None:
-            # node.data is a DirEntry(path=PosixPath(...)) — extract .path
-            path = getattr(data, "path", data)
-            self.query_one("#dp-input", Input).value = str(path)
-
-    @on(Input.Changed, "#dp-input")
-    def _input_changed(self, event: Input.Changed) -> None:
-        path = os.path.expanduser(event.value.strip())
-        if os.path.isdir(path):
-            self.query_one("#dp-tree", DirectoryTree).path = Path(path)
-
-    def on_input_key(self, event: Key) -> None:
-        if event.key == "tab":
-            if self._ssh_mode:
-                # Tab through SSH fields handled elsewhere
-                return
-            # Tab in path input → try to complete the partial directory name
-            inp   = self.query_one("#dp-input", Input)
-            typed = os.path.expanduser(inp.value.strip())
-            completed = self._tab_complete(typed)
-            if completed and completed != typed:
-                inp.value  = completed
-                inp.cursor_position = len(completed)
-            else:
-                # Nothing to complete — focus tree instead
-                self.query_one("#dp-tree", DirectoryTree).focus()
-            event.stop()
-
-    @staticmethod
-    def _tab_complete(typed: str) -> str:
-        """Return the longest unambiguous completion for a partial path."""
-        if not typed:
-            return typed
-        # If typed is already an exact directory, append separator and return
-        if os.path.isdir(typed):
-            return typed.rstrip("/") + "/"
-        parent  = os.path.dirname(typed) or "/"
-        prefix  = os.path.basename(typed).lower()
-        if not os.path.isdir(parent):
-            return typed
-        try:
-            matches = sorted(
-                e for e in os.listdir(parent)
-                if e.lower().startswith(prefix)
-                and os.path.isdir(os.path.join(parent, e))
-            )
-        except PermissionError:
-            return typed
-        if not matches:
-            return typed
-        if len(matches) == 1:
-            return os.path.join(parent, matches[0]) + "/"
-        # Multiple matches — complete to longest common prefix
-        common = os.path.commonprefix(matches)
-        return os.path.join(parent, common) if common else typed
-
-    @on(DirectoryTree.FileSelected, "#dp-tree")
-    def _file_selected(self, event: DirectoryTree.FileSelected) -> None:
-        self.dismiss(str(Path(str(event.path)).parent))
-
-    def on_directory_tree_directory_selected(self, event) -> None:
-        try:
-            self.dismiss(str(event.path))
-        except AttributeError:
-            pass
-
-    @on(Input.Submitted, "#dp-input")
-    def _local_submitted(self, event: Input.Submitted) -> None:
-        path = os.path.expanduser(event.value.strip())
-        if os.path.isdir(path):
-            self.dismiss(path)
-        else:
-            self.notify(f"Not a directory: {path}", severity="error", timeout=3)
-
-    # ── SSH form submit ───────────────────────────────────────────────────
-
-    @on(Input.Submitted, "#dp-ssh-host")
-    @on(Input.Submitted, "#dp-ssh-user")
-    @on(Input.Submitted, "#dp-ssh-port")
-    @on(Input.Submitted, "#dp-ssh-path")
-    def _ssh_field_submitted(self, event: Input.Submitted) -> None:
-        """Tab through SSH fields; submit on the last one."""
-        order = ["dp-ssh-host", "dp-ssh-user", "dp-ssh-port", "dp-ssh-path"]
-        current = event.input.id
-        try:
-            next_id = order[order.index(current) + 1]
-            self.query_one(f"#{next_id}", Input).focus()
-        except IndexError:
-            # Last field — attempt mount
-            self._submit_ssh()
-        event.stop()
-
-    def _submit_ssh(self) -> None:
-        from core.ssh_mount import SSHInfo, mount as ssh_mount, is_available as sshfs_available
-
-        host = self.query_one("#dp-ssh-host", Input).value.strip()
-        if not host:
-            self.notify("Host is required.", severity="error", timeout=3)
-            self.query_one("#dp-ssh-host", Input).focus()
-            return
-
-        user      = self.query_one("#dp-ssh-user", Input).value.strip()
-        port_str  = self.query_one("#dp-ssh-port", Input).value.strip() or "22"
-        rpath     = self.query_one("#dp-ssh-path", Input).value.strip() or "~"
-
-        try:
-            port = int(port_str)
-        except ValueError:
-            self.notify("Port must be a number.", severity="error", timeout=3)
-            return
-
-        if not sshfs_available():
-            self.notify(
-                "sshfs not found. Install: brew install macfuse (macOS) or apt install sshfs (Linux)",
-                severity="error", timeout=6,
-            )
-            return
-
-        info = SSHInfo(host=host, user=user, port=port, remote_path=rpath)
-        self.notify(f"Mounting {info.display}…", timeout=4)
-
-        # Run sshfs in a thread so the TUI doesn't freeze
-        import threading
-
-        def _do_mount():
-            try:
-                local = ssh_mount(info, timeout=20)
-                self.app.call_from_thread(
-                    self.dismiss,
-                    {"path": local, "ssh_info": info.to_dict()},
-                )
-            except Exception as exc:
-                self.app.call_from_thread(
-                    self.notify,
-                    f"SSH mount failed: {exc}",
-                    severity="error",
-                    timeout=8,
-                )
-
-        threading.Thread(target=_do_mount, daemon=True).start()
-
-    def action_cancel(self) -> None:
-        self.dismiss(None)
+# DirectoryPickerScreen imported from ui.screens
 
 
 # ---------------------------------------------------------------------------
 # StatusBar — permission mode indicator + current project
 # ---------------------------------------------------------------------------
 
-_PERM_LABELS = {
-    "plan":         ("PLAN 📋",        "$accent"),
-    "safe":         ("SAFE",          "$success"),
-    "accept_edits": ("ACCEPT EDITS",  "$warning"),
-    "bypass":       ("BYPASS ALL ⚡", "$error"),
-}
-_PERM_CYCLE = ["plan", "safe", "accept_edits", "bypass"]
-
-# Compact friendly names for the inline permission indicator
-_PERM_INDICATOR_NAMES: dict[str, str] = {
-    "plan":         "plan",
-    "safe":         "safe",
-    "accept_edits": "accept edits",
-    "bypass":       "bypass all",
-}
-
-
-def _perm_indicator_text(mode: str, project: str = "") -> str:
-    """Return indicator line text, e.g. '⏵⏵ accept edits  ·  myproject'."""
-    label = _PERM_INDICATOR_NAMES.get(mode, mode)
-    proj_part = f"  ·  {project}" if project else ""
-    return f"⏵⏵ {label}{proj_part}"
-
-
-_AGENT_LABELS: dict[str, tuple[str, str]] = {
-    "claude":    ("Claude",    "$accent"),
-    "codex":     ("Codex",     "$warning"),
-    "cursor":    ("Cursor",    "$success"),
-    "openclaw":  ("OpenClaw",  "$error"),
-}
-_AGENT_CYCLE = ["claude", "codex", "cursor", "openclaw"]
-
-_EFFORT_LABELS: dict[str, tuple[str, str]] = {
-    "low":    ("LOW ⚡",   "$success"),
-    "medium": ("MEDIUM",  "$text-muted"),
-    "high":   ("HIGH 🧠", "$warning"),
-}
-_EFFORT_CYCLE = ["low", "medium", "high"]
+# _PERM_LABELS, _PERM_CYCLE, _PERM_INDICATOR_NAMES, _perm_indicator_text,
+# _AGENT_LABELS, _AGENT_CYCLE, _EFFORT_LABELS, _EFFORT_CYCLE
+# all imported from ui.constants
 
 
 class OpenClawInboxPanel(Static):
@@ -2447,6 +2231,242 @@ class OpenClawInboxPanel(Static):
             pass
 
 
+# ---------------------------------------------------------------------------
+# ObsidianPanel — external Obsidian vault file tree + todo extractor
+# ---------------------------------------------------------------------------
+
+class _ObsidianTree(Tree):
+    """Tree subclass that lets Space mark/unmark file nodes instead of expanding."""
+
+    class ToggleMark(Message):
+        def __init__(self, path: str) -> None:
+            self.path = path
+            super().__init__()
+
+    def on_key(self, event: Key) -> None:
+        if event.key == "space":
+            node = self.cursor_node
+            if node and node.data:
+                # It's a file leaf — toggle mark instead of expanding
+                self.post_message(self.ToggleMark(str(node.data)))
+                event.prevent_default()
+                event.stop()
+                return
+        # Directory nodes or any other key: default Tree behaviour
+
+
+class ObsidianPanel(Static):
+    """
+    External Obsidian vault file tree + todo extractor. Toggle with O (shift+o).
+
+    File view:
+      ↑↓   navigate tree
+      Space mark / unmark current note for this project
+      a     auto-detect and mark relevant notes
+      T     switch to todos view
+      O     close panel
+
+    Todos view:
+      ↑↓   navigate
+      T     back to file view
+    """
+
+    DEFAULT_CSS = """
+    ObsidianPanel {
+        width: 1fr;
+        height: 1fr;
+        background: $background;
+    }
+    .op-header {
+        height: 1;
+        background: $primary-darken-3;
+        color: $text-muted;
+        padding: 0 1;
+    }
+    .op-tree  { height: 1fr; }
+    .op-footer {
+        height: 1;
+        background: $surface;
+        color: $text-muted;
+        padding: 0 1;
+    }
+    """
+
+    class NoteOpened(Message):
+        """Posted when the user selects a note (Enter/click) — open in editor."""
+        def __init__(self, path: str) -> None:
+            self.path = path
+            super().__init__()
+
+    def __init__(self, **kwargs) -> None:
+        super().__init__(**kwargs)
+        self._obsidian_vault:  ObsidianVault | None  = None
+        self._linker:          ObsidianLinker | None = None
+        self._project_name:    str = ""
+        self._project_path:    str = ""
+        self._view:            str = "files"   # "files" | "todos"
+
+    def compose(self) -> ComposeResult:
+        yield Label(
+            " OBSIDIAN  [dim](Space=mark/unmark · a=auto-detect · T=todos · O=close)[/dim]",
+            id="op-header", classes="op-header",
+        )
+        yield _ObsidianTree("Vault", id="op-tree", classes="op-tree")
+        yield Label("", id="op-footer", classes="op-footer")
+
+    def on_mount(self) -> None:
+        self._populate()
+
+    # ── public API ────────────────────────────────────────────────────────
+
+    def refresh_for_project(
+        self,
+        project_name: str,
+        project_path: str,
+        obsidian_vault: ObsidianVault | None,
+        linker: ObsidianLinker | None,
+    ) -> None:
+        self._project_name   = project_name
+        self._project_path   = project_path
+        self._obsidian_vault = obsidian_vault
+        self._linker         = linker
+        self._populate()
+
+    # ── internal ─────────────────────────────────────────────────────────
+
+    def _populate(self) -> None:
+        tree   = self.query_one("#op-tree",   _ObsidianTree)
+        footer = self.query_one("#op-footer", Label)
+        tree.clear()
+
+        if not self._obsidian_vault or not self._obsidian_vault.exists():
+            leaf = tree.root.add_leaf("(no Obsidian vault connected)")
+            leaf.data = None
+            tree.root.add_leaf("  Use /obsidian <path> to connect one")
+            tree.root.expand()
+            footer.update(" /obsidian <path> to enable  ·  O to close")
+            return
+
+        if self._view == "files":
+            self._populate_files(tree)
+            n = len(self._linker.get_project_notes(self._project_name)) if self._linker else 0
+            proj = self._project_name or "project"
+            footer.update(f" {n} marked for {proj}  ·  T=todos  ·  a=auto-detect")
+        else:
+            self._populate_todos(tree)
+            footer.update(" T=back to files  ·  O to close")
+
+    def _populate_files(self, tree: _ObsidianTree) -> None:
+        vault_root = self._obsidian_vault.root  # type: ignore[union-attr]
+        marked     = set(self._linker.get_project_notes(self._project_name)) if self._linker else set()
+        tree.root.label = os.path.basename(vault_root) or "Obsidian"
+        self._build_dir_node(tree.root, vault_root, marked)
+        tree.root.expand()
+
+    def _build_dir_node(self, parent_node, dir_path: str, marked: set) -> None:
+        try:
+            entries = sorted(
+                os.scandir(dir_path),
+                key=lambda e: (not e.is_dir(), e.name.lower()),
+            )
+        except PermissionError:
+            return
+        for entry in entries:
+            if entry.name.startswith("."):
+                continue
+            if entry.is_dir():
+                node = parent_node.add(f"  {entry.name}")
+                node.data = None
+                self._build_dir_node(node, entry.path, marked)
+            elif entry.name.endswith(".md"):
+                title = entry.name[:-3]
+                label = f"● {title}" if entry.path in marked else f"  {title}"
+                leaf  = parent_node.add_leaf(label)
+                leaf.data = entry.path
+
+    def _populate_todos(self, tree: _ObsidianTree) -> None:
+        tree.root.label = "Todos"
+        if not self._linker or not self._obsidian_vault:
+            tree.root.add_leaf("(no marked notes)")
+            tree.root.expand()
+            return
+
+        marked_paths = self._linker.get_project_notes(self._project_name)
+        if not marked_paths:
+            tree.root.add_leaf("(no marked notes — mark files in file view first)")
+            tree.root.expand()
+            return
+
+        has_todos = False
+        for path in marked_paths:
+            try:
+                from memory.obsidian import ObsidianNote
+                note  = ObsidianNote.from_file(path)
+                todos = note.todos()
+                if todos:
+                    note_node = tree.root.add(f"  {note.title}")
+                    note_node.data = path
+                    for todo in todos:
+                        leaf      = note_node.add_leaf(f"  ☐ {todo[:100]}")
+                        leaf.data = path
+                    note_node.expand()
+                    has_todos = True
+            except Exception:
+                pass
+
+        if not has_todos:
+            tree.root.add_leaf("(no unchecked todos in marked notes)")
+        tree.root.expand()
+
+    # ── key handling ─────────────────────────────────────────────────────
+
+    def on_key(self, event: Key) -> None:
+        key  = event.key
+        char = event.character or ""
+        if char == "T":
+            self._view = "todos" if self._view == "files" else "files"
+            self._populate()
+            event.stop()
+        elif char == "a":
+            self._auto_detect()
+            event.stop()
+
+    @on(_ObsidianTree.ToggleMark)
+    def _toggle_mark(self, event: _ObsidianTree.ToggleMark) -> None:
+        if not self._linker or self._view != "files":
+            return
+        path = event.path
+        if self._linker.is_marked(self._project_name, path):
+            self._linker.unmark(self._project_name, path)
+        else:
+            self._linker.mark(self._project_name, path)
+        self._populate()
+
+    @on(Tree.NodeSelected, "#op-tree")
+    def _node_selected(self, event: Tree.NodeSelected) -> None:
+        if event.node.data:
+            self.post_message(ObsidianPanel.NoteOpened(str(event.node.data)))
+
+    def _auto_detect(self) -> None:
+        if not self._obsidian_vault or not self._linker or not self._project_name:
+            self.app.notify("No vault or project configured.", severity="warning", timeout=3)
+            return
+        notes   = self._obsidian_vault.all_notes()
+        marked  = 0
+        for note in notes:
+            score = self._obsidian_vault.score_relevance(
+                note, self._project_name, self._project_path
+            )
+            if score >= 0.5:
+                self._linker.mark(self._project_name, note.path)
+                marked += 1
+        self._populate()
+        self.app.notify(
+            f"Auto-detected {marked} relevant note(s) for {self._project_name}",
+            timeout=4,
+        )
+
+
 class StatusBar(Static):
     """Thin bar showing agent type, permission mode, active project, and effort."""
 
@@ -2564,6 +2584,7 @@ class ShortcutsBar(Static):
         ("m",      "graph"),
         ("t",      "terminal"),
         ("c",      "channels"),
+        ("⇧O",     "obsidian"),
         ("q",      "quit"),
     ]
 
@@ -2576,238 +2597,8 @@ class ShortcutsBar(Static):
         yield Label("  ·  ".join(parts), classes="sc-rest")
 
 
-# ---------------------------------------------------------------------------
-# BrainImportScreen — modal for importing a brain/memory folder into the vault
-# ---------------------------------------------------------------------------
-
-class BrainImportScreen(ModalScreen):
-    """Prompt for a folder path and import its .md files into the vault."""
-
-    DEFAULT_CSS = """
-    BrainImportScreen {
-        align: center middle;
-    }
-    #brain-import-container {
-        width: 72;
-        height: auto;
-        background: $surface;
-        border: solid $accent;
-        padding: 1 2;
-    }
-    #brain-import-title {
-        text-align: center;
-        color: $accent;
-        margin-bottom: 1;
-    }
-    #brain-import-label {
-        color: $text-muted;
-        margin-bottom: 0;
-    }
-    #brain-import-input {
-        width: 1fr;
-        margin-bottom: 1;
-    }
-    #brain-import-hint {
-        color: $text-muted;
-        text-align: center;
-        margin-top: 1;
-    }
-    """
-
-    def compose(self) -> ComposeResult:
-        with Vertical(id="brain-import-container"):
-            yield Label("─── Import Brain / Memory Folder ───", id="brain-import-title")
-            yield Label("Folder path (or single .md file):", id="brain-import-label")
-            yield Input(placeholder="/path/to/your/brain", id="brain-import-input")
-            yield Label("↵=import  Esc=cancel", id="brain-import-hint")
-
-    def on_mount(self) -> None:
-        self.query_one("#brain-import-input", Input).focus()
-
-    def on_key(self, event) -> None:
-        if event.key == "escape":
-            self.dismiss(None)
-            event.stop()
-
-    def on_input_submitted(self, event: Input.Submitted) -> None:
-        path = event.value.strip()
-        if path:
-            self.dismiss(path)
-        else:
-            self.dismiss(None)
-
-
-# ---------------------------------------------------------------------------
-# DetachMenuScreen — modal listing detached agents for reattachment
-# ---------------------------------------------------------------------------
-
-class DetachMenuScreen(ModalScreen):
-    """Modal listing detached agents — Enter to reattach, Delete to kill.
-
-    Actions execute in-place: the list updates immediately and the screen
-    stays open so the user can perform multiple operations before closing.
-    """
-
-    DEFAULT_CSS = """
-    DetachMenuScreen {
-        align: center middle;
-    }
-    #detach-menu-container {
-        width: 72;
-        max-height: 24;
-        background: $surface;
-        border: solid $accent;
-        padding: 1 2;
-    }
-    .dm-title {
-        text-align: center;
-        color: $accent;
-        margin-bottom: 1;
-    }
-    .dm-item {
-        padding: 0 1;
-        color: $text;
-        width: 1fr;
-    }
-    .dm-item-focused {
-        background: $accent-darken-2;
-        color: $text;
-    }
-    .dm-empty {
-        color: $text-muted;
-        text-align: center;
-        padding: 1;
-    }
-    .dm-hint {
-        color: $text-muted;
-        text-align: center;
-        margin-top: 1;
-    }
-    """
-
-    def __init__(
-        self,
-        detached: list[dict],
-        on_reattach: "Callable[[dict], None]",
-        on_kill: "Callable[[dict], None]",
-    ) -> None:
-        super().__init__()
-        # Live reference — mutations here propagate to the app's _detached list
-        self._detached = detached
-        self._on_reattach = on_reattach
-        self._on_kill = on_kill
-        self._cursor: int = 0
-
-    def compose(self) -> ComposeResult:
-        with Vertical(id="detach-menu-container"):
-            yield Label("─── Detached Agents ───", classes="dm-title")
-            if not self._detached:
-                yield Label("No detached agents for this project.", classes="dm-empty")
-            else:
-                for i, state in enumerate(self._detached):
-                    yield Label(self._item_text(i, state),
-                                id=f"dm-item-{i}",
-                                classes="dm-item dm-item-focused" if i == 0 else "dm-item")
-            yield Label("↑↓/j/k=navigate  ↵=reattach  Del=kill  Esc=close", classes="dm-hint")
-
-    # ── helpers ───────────────────────────────────────────────────────────────
-
-    @staticmethod
-    def _item_text(i: int, state: dict) -> str:
-        prompt     = state.get("prompt", "")[:52]
-        agent_type = state.get("agent_type", "claude")
-        return f"[{i+1}]  [{agent_type}]  {prompt}"
-
-    def _rebuild_items(self) -> None:
-        """Remove all item labels and re-mount from the current list."""
-        for lbl in self.query(".dm-item, .dm-empty"):
-            lbl.remove()
-        container = self.query_one("#detach-menu-container")
-        hint      = self.query_one(".dm-hint")
-        if not self._detached:
-            container.mount(
-                Label("No detached agents for this project.", classes="dm-empty"),
-                before=hint,
-            )
-            self._cursor = 0
-        else:
-            self._cursor = min(self._cursor, len(self._detached) - 1)
-            for i, state in enumerate(self._detached):
-                classes = "dm-item dm-item-focused" if i == self._cursor else "dm-item"
-                container.mount(
-                    Label(self._item_text(i, state), id=f"dm-item-{i}", classes=classes),
-                    before=hint,
-                )
-
-    def _move_cursor(self, delta: int) -> None:
-        if not self._detached:
-            return
-        old = self._cursor
-        self._cursor = (self._cursor + delta) % len(self._detached)
-        try:
-            self.query_one(f"#dm-item-{old}", Label).remove_class("dm-item-focused")
-            self.query_one(f"#dm-item-{self._cursor}", Label).add_class("dm-item-focused")
-        except Exception:
-            pass
-
-    def _do_reattach(self) -> None:
-        if not self._detached:
-            return
-        state = self._detached.pop(self._cursor)
-        self._on_reattach(state)
-        self._rebuild_items()
-
-    def _do_kill(self) -> None:
-        if not self._detached:
-            return
-        state = self._detached.pop(self._cursor)
-        self._on_kill(state)
-        self._rebuild_items()
-
-    # ── key handling ─────────────────────────────────────────────────────────
-
-    def on_key(self, event) -> None:
-        key  = event.key
-        char = event.character or ""
-
-        if key == "escape":
-            self.dismiss(None)
-            event.stop()
-            return
-
-        if key in ("down", "j"):
-            self._move_cursor(1)
-            event.stop()
-            return
-
-        if key in ("up", "k"):
-            self._move_cursor(-1)
-            event.stop()
-            return
-
-        if key == "enter":
-            self._do_reattach()
-            event.stop()
-            return
-
-        if key == "delete":
-            self._do_kill()
-            event.stop()
-            return
-
-        # 1-9: jump cursor to that item
-        if char.isdigit() and int(char) > 0:
-            idx = int(char) - 1
-            if idx < len(self._detached):
-                old = self._cursor
-                self._cursor = idx
-                try:
-                    self.query_one(f"#dm-item-{old}", Label).remove_class("dm-item-focused")
-                    self.query_one(f"#dm-item-{self._cursor}", Label).add_class("dm-item-focused")
-                except Exception:
-                    pass
-            event.stop()
-            return
+# BrainImportScreen, DetachMenuScreen, _ObsidianPathScreen, CommandPaletteScreen
+# imported from ui.screens
 
 
 # ---------------------------------------------------------------------------
@@ -2837,19 +2628,20 @@ class VibeCLIApp(App[None]):
         Binding("k",     "scroll_up",        "↑"),
         Binding("f",     "toggle_files",     "Files"),
         Binding("e",     "toggle_editor",    "Editor"),
-        Binding("i",     "enter_edit",       "Edit File"),
         Binding("m",     "toggle_graph",     "Memory"),
         Binding("t",     "toggle_terminal",  "Terminal"),
         Binding("ctrl+t","toggle_terminal",  "Terminal", show=False),
+        Binding("ctrl+p","open_palette",     "Command Palette", show=False),
         Binding("r",     "reattach_menu",    "Reattach"),
         Binding("c",     "toggle_inbox",     "Channels"),
+        Binding("O",     "toggle_obsidian",  "Obsidian", show=False),
         Binding("E",     "cycle_effort",        "Effort"),
         Binding("B",     "import_brain",        "Import Brain"),
         Binding("G",              "toggle_git_commit",     "Git Auto-Commit",             show=False),
         Binding("V",              "toggle_verbose_default","Verbose Output (new agents)", show=False),
         Binding("ctrl+o",         "toggle_agent_verbose",  "Expand/Collapse Output",      show=False),
         Binding("ctrl+backslash", "cycle_permissions",     "Cycle Permission Mode",        show=False),
-        Binding("s",      "save_file",             "Save"),
+        Binding("s",     "save_file",         "Save", show=False),
         Binding("escape","exit_mode",        "Back", show=False),
         Binding("q",     "quit",             "Quit"),
     ]
@@ -2919,6 +2711,19 @@ class VibeCLIApp(App[None]):
         # Manual prompt shortcuts for keys [6]-[0] — 5 slots, loaded from vault
         self._manual_shortcuts: list[str] = self._load_manual_shortcuts(vault_root)
 
+        # UI theme — persisted to config.json under ui.theme
+        self._ui_theme: str = config.get("ui", {}).get("theme", "textual-dark")
+
+        # Obsidian integration (opt-in via /obsidian <path> or config)
+        self._obsidian_vault_path: str = config.get("obsidian", {}).get("vault_path", "")
+        self._show_obsidian: bool = False
+        if self._obsidian_vault_path:
+            self._obsidian_vault:  ObsidianVault | None  = ObsidianVault(self._obsidian_vault_path)
+            self._obsidian_linker: ObsidianLinker | None = ObsidianLinker(self._vault)
+        else:
+            self._obsidian_vault  = None
+            self._obsidian_linker = None
+
         # Prompt history shared across PromptBar and all agent reply inputs.
         # Newest entry is at the end.  Per-input browse state is tracked by
         # input widget ID → {"idx": int, "saved": str}
@@ -2942,10 +2747,18 @@ class VibeCLIApp(App[None]):
                 yield TerminalPanel(id="terminal-panel")
             yield GraphPane(self._vault, id="graph-pane")
             yield OpenClawInboxPanel(id="inbox-panel")
+            yield ObsidianPanel(id="obsidian-panel")
         yield PromptBar(id="prompt-bar")
         yield ShortcutsBar(id="shortcuts-bar")
 
     async def on_mount(self) -> None:
+        # Register custom themes before session restore so they're available immediately
+        for _t in _CUSTOM_THEMES:
+            try:
+                self.register_theme(_t)
+            except Exception:
+                pass
+
         # Re-mount any SSH projects that were saved in projects.json
         self._remount_ssh_projects()
 
@@ -2953,11 +2766,12 @@ class VibeCLIApp(App[None]):
         await self._approval_server.start()
 
         # Start in command mode — agent panel holds focus
-        self.query_one("#file-browser").display   = False
+        self.query_one("#file-browser").display    = False
         self.query_one("#editor-panel").display   = False
         self.query_one("#graph-pane").display     = False
         self.query_one("#terminal-panel").display = False
         self.query_one("#inbox-panel").display    = False
+        self.query_one("#obsidian-panel").display = False
 
         active = self._pm.active
         if active:
@@ -2987,6 +2801,9 @@ class VibeCLIApp(App[None]):
 
         self._refresh_suggestions()
         self.query_one("#prompt-bar", PromptBar).manual_shortcuts = list(self._manual_shortcuts)
+
+        # Apply persisted UI theme after first render so all widgets exist
+        self.call_after_refresh(self._apply_persisted_theme)
 
         # Focus the agent panel → command mode
         self.query_one("#agent-panel", AgentPanel).focus()
@@ -3033,7 +2850,12 @@ class VibeCLIApp(App[None]):
                 event.stop()
                 return
             if in_edit:
-                self.query_one("#editor-panel", EditorPanel).exit_edit_mode()
+                # Auto-save on escape (both regular files and audio annotation)
+                ep = self.query_one("#editor-panel", EditorPanel)
+                ep.save()
+                # For non-audio: switch to colorized Rich Syntax view
+                if not ep._audio_mode:
+                    ep.switch_to_view_mode()
                 self._exit_to_command()
                 event.stop()
                 return
@@ -3061,10 +2883,12 @@ class VibeCLIApp(App[None]):
 
         # ── up/down (while typing): browse prompt history ──────────────────
         if in_input and key in ("up", "down") and isinstance(focused, Input):
-            self._browse_input_history(key, focused)
-            event.prevent_default()
-            event.stop()
-            return
+            iid = focused.id or ""
+            if iid == "pb-input" or iid.startswith("agent-reply-"):
+                self._browse_input_history(key, focused)
+                event.prevent_default()
+                event.stop()
+                return
 
         # All remaining shortcuts only apply in command mode
         if in_input or in_edit:
@@ -3469,15 +3293,15 @@ class VibeCLIApp(App[None]):
             self.query_one("#file-browser", FileBrowserPanel).focus_tree()
 
     def action_toggle_editor(self) -> None:
-        self._show_editor = not self._show_editor
-        self._apply_layout()
-
-    def action_enter_edit(self) -> None:
-        if not self._show_editor:
-            # Auto-show editor first
-            self._show_editor = True
+        ep = self.query_one("#editor-panel", EditorPanel)
+        if self._show_editor and ep._in_view_mode:
+            # Editor is visible in colorized read-only view: e closes the panel,
+            # so the next e press reopens it in edit mode (two-key read→close→edit).
+            self._show_editor = False
             self._apply_layout()
-        self.query_one("#editor-panel", EditorPanel).enter_edit_mode()
+        else:
+            self._show_editor = not self._show_editor
+            self._apply_layout()
 
     def action_toggle_graph(self) -> None:
         self._show_graph = not self._show_graph
@@ -3501,6 +3325,155 @@ class VibeCLIApp(App[None]):
             # Stop gateway when panel is closed to save resources
             self._stop_gateway_client()
 
+    def action_toggle_obsidian(self) -> None:
+        """Toggle the Obsidian vault panel (O)."""
+        if not self._obsidian_vault_path:
+            self.notify(
+                "No Obsidian vault connected.  "
+                "Use [bold]/obsidian <path>[/bold] to attach one.",
+                timeout=5,
+            )
+            return
+        self._show_obsidian = not self._show_obsidian
+        if self._show_obsidian:
+            self._show_graph = False   # mutually exclusive full-screen views
+        self._apply_layout()
+
+    def action_open_palette(self) -> None:
+        """Open the command palette (ctrl+p)."""
+        commands = self._build_palette_commands()
+
+        def _on_result(key: str | None) -> None:
+            if key is None:
+                return
+            handler = self._palette_handlers().get(key)
+            if handler:
+                handler()
+
+        self.push_screen(CommandPaletteScreen(commands), _on_result)
+
+    def _build_palette_commands(self) -> "list[tuple[str, str, str | None]]":
+        """
+        Build the full palette command list.
+
+        Each entry: (display name, description, id_key)
+        Entries with id_key=None are visual separators (filtered out).
+        The currently active option gets a ✓ prefix.
+        """
+        perm  = self._perm_mode
+        agent = self._agent_type
+        eff   = self._effort_mode
+
+        def mark(active: bool) -> str:
+            return "✓ " if active else "  "
+
+        cmds: list[tuple[str, str, str | None]] = []
+
+        # ── Agent ────────────────────────────────────────────────────────
+        cmds += [
+            (f"{mark(agent=='claude')}Agent: Claude",    "use Claude Code CLI",         "agent:claude"),
+            (f"{mark(agent=='codex')}Agent: Codex",      "use OpenAI Codex CLI",        "agent:codex"),
+            (f"{mark(agent=='cursor')}Agent: Cursor",    "use Cursor CLI",              "agent:cursor"),
+            (f"{mark(agent=='openclaw')}Agent: OpenClaw","use OpenClaw agent",           "agent:openclaw"),
+        ]
+
+        # ── Permission mode ──────────────────────────────────────────────
+        cmds += [
+            (f"{mark(perm=='plan')}Permission: Plan",           "read-only, no edits",              "perm:plan"),
+            (f"{mark(perm=='safe')}Permission: Safe",           "approve every tool call",          "perm:safe"),
+            (f"{mark(perm=='accept_edits')}Permission: Accept Edits", "auto-approve file edits",   "perm:accept_edits"),
+            (f"{mark(perm=='bypass')}Permission: Bypass All",   "no restrictions",                  "perm:bypass"),
+        ]
+
+        # ── Effort level ─────────────────────────────────────────────────
+        cmds += [
+            (f"{mark(eff=='low')}Effort: Low",    "faster, lighter reasoning",  "effort:low"),
+            (f"{mark(eff=='medium')}Effort: Medium", "balanced (default)",       "effort:medium"),
+            (f"{mark(eff=='high')}Effort: High",  "deep, thorough reasoning",   "effort:high"),
+        ]
+
+        # ── Panels ───────────────────────────────────────────────────────
+        cmds += [
+            ("Toggle File Browser",   "f — show / hide file tree",       "panel:files"),
+            ("Toggle Editor",         "e — show / hide file editor",     "panel:editor"),
+            ("Toggle Memory Graph",   "m — show / hide memory graph",    "panel:graph"),
+            ("Toggle Terminal",       "t — show / hide embedded shell",  "panel:terminal"),
+            ("Toggle Channels",       "c — show / hide OpenClaw inbox",  "panel:channels"),
+            ("Toggle Obsidian Panel", "O — show / hide Obsidian vault",  "panel:obsidian"),
+        ]
+
+        # ── Theme ────────────────────────────────────────────────────────
+        for _group_label, _group_themes in self._THEME_GROUPS:
+            for _tid, _tlabel in _group_themes:
+                active_mark = "✓ " if self._ui_theme == _tid else "  "
+                cmds.append((
+                    f"{active_mark}Theme: {_tlabel}",
+                    f"{_group_label.lower()} · {_tid}",
+                    f"theme:{_tid}",
+                ))
+
+        # ── Config & actions ─────────────────────────────────────────────
+        git_state  = "ON" if self._auto_commit  else "OFF"
+        verb_state = "ON" if self._verbose_default else "OFF"
+        cmds += [
+            (f"Git Auto-Commit+Push: {git_state}", "G to toggle",         "toggle:git"),
+            (f"Verbose Output Default: {verb_state}", "V to toggle",      "toggle:verbose"),
+            ("Open Project…",         "open a directory as a project",   "action:open_project"),
+            ("Import Brain / Memory…","import .md notes into vault",     "action:import_brain"),
+            ("Connect Obsidian Vault…","set external Obsidian vault path","action:obsidian"),
+            ("Quit",                  "save session and exit",            "action:quit"),
+        ]
+
+        return cmds
+
+    def _palette_handlers(self) -> dict[str, Callable[[], None]]:
+        """Map palette id_key → zero-arg callable."""
+        return {
+            # Agent
+            "agent:claude":    lambda: self._scmd_agent("claude"),
+            "agent:codex":     lambda: self._scmd_agent("codex"),
+            "agent:cursor":    lambda: self._scmd_agent("cursor"),
+            "agent:openclaw":  lambda: self._scmd_agent("openclaw"),
+            # Permission
+            "perm:plan":          lambda: self._scmd_perm("plan"),
+            "perm:safe":          lambda: self._scmd_perm("safe"),
+            "perm:accept_edits":  lambda: self._scmd_perm("accept_edits"),
+            "perm:bypass":        lambda: self._scmd_perm("bypass"),
+            # Effort
+            "effort:low":     lambda: self._scmd_effort("low"),
+            "effort:medium":  lambda: self._scmd_effort("medium"),
+            "effort:high":    lambda: self._scmd_effort("high"),
+            # Panels
+            "panel:files":    self.action_toggle_files,
+            "panel:editor":   self.action_toggle_editor,
+            "panel:graph":    self.action_toggle_graph,
+            "panel:terminal": self.action_toggle_terminal,
+            "panel:channels": self.action_toggle_inbox,
+            "panel:obsidian": self.action_toggle_obsidian,
+            # Themes
+            **{
+                f"theme:{tid}": (lambda t=tid: self._set_theme(t))
+                for _, group in self._THEME_GROUPS
+                for tid, _ in group
+            },
+            # Toggles
+            "toggle:git":     self._toggle_git_commit,
+            "toggle:verbose": self.action_toggle_verbose_default,
+            # Actions
+            "action:open_project":  self.action_open_project,
+            "action:import_brain":  self.action_import_brain,
+            "action:obsidian":      lambda: self._prompt_obsidian_path(),
+            "action:quit":          self.action_quit,
+        }
+
+    def _prompt_obsidian_path(self) -> None:
+        """Push a path-input modal to set the Obsidian vault path."""
+        def _on_path(path: str | None) -> None:
+            if path:
+                self._scmd_obsidian(path.strip())
+
+        self.push_screen(_ObsidianPathScreen(), _on_path)
+
     def action_run_last_command(self) -> None:
         if not self._last_command:
             self.notify("No command detected yet.", timeout=2)
@@ -3515,11 +3488,9 @@ class VibeCLIApp(App[None]):
 
     def action_save_file(self) -> None:
         ep = self.query_one("#editor-panel", EditorPanel)
-        if ep.is_in_edit_mode:
-            ep.save()
-            self.notify("Saved.", timeout=2)
-        else:
-            self.notify("Not in edit mode (press i first).", timeout=2)
+        if ep.current_path:
+            if ep.save():
+                self.notify("Saved.", timeout=2)
 
     def action_exit_mode(self) -> None:
         self._exit_to_command()
@@ -3527,30 +3498,49 @@ class VibeCLIApp(App[None]):
     # ------------------------------------------------------------------ layout
 
     def _apply_layout(self) -> None:
-        fb    = self.query_one("#file-browser",   FileBrowserPanel)
-        ep    = self.query_one("#editor-panel",   EditorPanel)
-        ap    = self.query_one("#agent-panel",    AgentPanel)
-        tp    = self.query_one("#terminal-panel", TerminalPanel)
-        graph = self.query_one("#graph-pane",     GraphPane)
-        inbox = self.query_one("#inbox-panel",    OpenClawInboxPanel)
+        fb       = self.query_one("#file-browser",   FileBrowserPanel)
+        ep       = self.query_one("#editor-panel",   EditorPanel)
+        ap       = self.query_one("#agent-panel",    AgentPanel)
+        tp       = self.query_one("#terminal-panel", TerminalPanel)
+        graph    = self.query_one("#graph-pane",     GraphPane)
+        inbox    = self.query_one("#inbox-panel",    OpenClawInboxPanel)
+        obsidian = self.query_one("#obsidian-panel", ObsidianPanel)
 
         if self._show_graph:
-            fb.display    = False
-            ep.display    = False
-            ap.display    = False
-            tp.display    = False
-            graph.display = True
-            inbox.display = False
+            fb.display       = False
+            ep.display       = False
+            ap.display       = False
+            tp.display       = False
+            graph.display    = True
+            inbox.display    = False
+            obsidian.display = False
             graph.query_one("#gp-tree", Tree).focus()
+        elif self._show_obsidian and self._obsidian_vault_path:
+            fb.display       = False
+            ep.display       = False
+            ap.display       = False
+            tp.display       = False
+            graph.display    = False
+            inbox.display    = False
+            obsidian.display = True
+            # Refresh panel with current project + vault state
+            active = self._pm.active
+            obsidian.refresh_for_project(
+                project_name  = active.name if active else "",
+                project_path  = active.path if active else "",
+                obsidian_vault = self._obsidian_vault,
+                linker        = self._obsidian_linker,
+            )
+            obsidian.query_one("#op-tree", _ObsidianTree).focus()
         else:
-            graph.display = False
-            fb.display    = self._show_files
-            ep.display    = self._show_editor
-            ap.display    = True
-            tp.display    = self._show_terminal
-            inbox.display = self._show_inbox
-            if not self._show_editor or not ep.is_in_edit_mode:
-                ap.focus()
+            graph.display    = False
+            obsidian.display = False
+            fb.display       = self._show_files
+            ep.display       = self._show_editor
+            ap.display       = True
+            tp.display       = self._show_terminal
+            inbox.display    = self._show_inbox
+            ap.focus()
 
     # ------------------------------------------------------------------ project switching
 
@@ -4127,6 +4117,14 @@ class VibeCLIApp(App[None]):
         self._apply_layout()
         self.query_one("#editor-panel", EditorPanel).load_file(event.path)
 
+    @on(ObsidianPanel.NoteOpened)
+    def _obsidian_note_opened(self, event: ObsidianPanel.NoteOpened) -> None:
+        """Open a selected Obsidian note in the editor."""
+        self._show_obsidian = False
+        self._show_editor   = True
+        self._apply_layout()
+        self.query_one("#editor-panel", EditorPanel).load_file(event.path)
+
     # ------------------------------------------------------------------ editor / file
 
     def _load_active_file(self, project: Project) -> None:
@@ -4166,6 +4164,7 @@ class VibeCLIApp(App[None]):
             "/compact":      self._scmd_compact,
             "/fork":         self._scmd_fork,
             "/help":         self._scmd_help,
+            "/obsidian":     self._scmd_obsidian,
         }
 
         if cmd in _DISPATCH:
@@ -4489,10 +4488,180 @@ class VibeCLIApp(App[None]):
             "/fork    [instruction]                  fork with context",
             "/clear                                  clear panel",
             "/compact                                compact history",
+            "/obsidian [path]                        connect Obsidian vault",
             "/help                                   show this message",
             "Claude also accepts: /init /memory /config /review …",
         ]
         self.notify("\n".join(lines), title="Slash commands", timeout=14)
+
+    def _scmd_obsidian(self, arg: str) -> None:
+        """
+        /obsidian <path>   — attach an Obsidian vault at <path> and persist it
+        /obsidian          — show current vault path (or hint if not set)
+        /obsidian clear    — detach the current vault
+        """
+        import json as _json
+
+        arg = arg.strip()
+
+        if not arg:
+            if self._obsidian_vault_path:
+                self.notify(
+                    f"Obsidian vault: {self._obsidian_vault_path}  ·  "
+                    "[bold]O[/bold] to toggle panel  ·  /obsidian clear to detach",
+                    timeout=6,
+                )
+            else:
+                self.notify(
+                    "No Obsidian vault connected.  Usage: /obsidian <path>",
+                    timeout=5,
+                )
+            return
+
+        if arg == "clear":
+            self._obsidian_vault_path = ""
+            self._obsidian_vault      = None
+            self._obsidian_linker     = None
+            self._show_obsidian       = False
+            self._apply_layout()
+            self._persist_obsidian_config("")
+            self.notify("Obsidian vault detached.", timeout=3)
+            return
+
+        # Set / update vault path
+        path = os.path.expanduser(arg)
+        if not os.path.isdir(path):
+            self.notify(f"Not a directory: {path}", severity="error", timeout=5)
+            return
+
+        self._obsidian_vault_path = path
+        self._obsidian_vault      = ObsidianVault(path)
+        if self._obsidian_linker is None:
+            self._obsidian_linker = ObsidianLinker(self._vault)
+
+        self._persist_obsidian_config(path)
+        self.notify(
+            f"Obsidian vault connected: {path}  ·  press [bold]O[/bold] to open",
+            timeout=5,
+        )
+        # Auto-open the panel
+        self._show_obsidian = True
+        self._show_graph    = False
+        self._apply_layout()
+
+    # ------------------------------------------------------------------ theme
+
+    #: All themes available in the palette, grouped for display.
+    _THEME_GROUPS: ClassVar[list[tuple[str, list[tuple[str, str]]]]] = [
+        ("Dark – Classic", [
+            ("textual-dark",         "Textual Dark"),
+            ("dracula",              "Dracula"),
+            ("monokai",              "Monokai"),
+            ("nord",                 "Nord"),
+            ("gruvbox",              "Gruvbox"),
+            ("tokyo-night",          "Tokyo Night"),
+            ("atom-one-dark",        "Atom One Dark"),
+            ("solarized-dark",       "Solarized Dark"),
+        ]),
+        ("Dark – Catppuccin & Rosé", [
+            ("catppuccin-mocha",     "Catppuccin Mocha"),
+            ("catppuccin-frappe",    "Catppuccin Frappé"),
+            ("catppuccin-macchiato", "Catppuccin Macchiato"),
+            ("rose-pine",            "Rosé Pine"),
+            ("rose-pine-moon",       "Rosé Pine Moon"),
+            ("flexoki",              "Flexoki"),
+        ]),
+        ("Dark – Vivid & Neon", [
+            ("cyberpunk",            "Cyberpunk"),
+            ("synthwave",            "Synthwave"),
+            ("night-owl",            "Night Owl"),
+            ("cobalt",               "Cobalt"),
+            ("horizon",              "Horizon"),
+            ("panda",                "Panda"),
+            ("matrix",               "Matrix"),
+            ("hacker",               "Hacker"),
+        ]),
+        ("Dark – Natural & Muted", [
+            ("everforest",           "Everforest"),
+            ("ayu-dark",             "Ayu Dark"),
+            ("ayu-mirage",           "Ayu Mirage"),
+            ("material-ocean",       "Material Ocean"),
+            ("palenight",            "Palenight"),
+            ("kanagawa",             "Kanagawa"),
+            ("mellow",               "Mellow"),
+            ("midnight-blue",        "Midnight Blue"),
+        ]),
+        ("Light", [
+            ("textual-light",        "Textual Light"),
+            ("textual-ansi",         "Textual ANSI"),
+            ("atom-one-light",       "Atom One Light"),
+            ("catppuccin-latte",     "Catppuccin Latte"),
+            ("rose-pine-dawn",       "Rosé Pine Dawn"),
+            ("solarized-light",      "Solarized Light"),
+            ("ayu-light",            "Ayu Light"),
+            ("paper",                "Paper"),
+            ("everforest-light",     "Everforest Light"),
+            ("warm-light",           "Warm Light"),
+        ]),
+    ]
+
+    def _apply_persisted_theme(self) -> None:
+        """Apply the UI theme stored in _ui_theme after the first render pass.
+
+        Called via call_after_refresh from on_mount so all widgets are ready
+        and custom themes have been registered.
+        """
+        name = self._ui_theme
+        if not name or name == "textual-dark":
+            return
+        try:
+            self.theme = name
+        except Exception:
+            # Theme not available — clear the stored value so we don't keep retrying
+            self._ui_theme = "textual-dark"
+
+    def _set_theme(self, name: str) -> None:
+        """Switch the app theme live and persist to both config.json and session."""
+        try:
+            self.theme = name
+        except Exception:
+            self.notify(f"Unknown theme: {name}", severity="warning", timeout=3)
+            return
+        self._ui_theme = name
+        self._persist_theme_config(name)
+        SessionStore().patch_global(ui_theme=name)
+        self.notify(f"Theme: {name}", timeout=2)
+
+    def _persist_theme_config(self, name: str) -> None:
+        import json as _json
+        config_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), "config.json")
+        try:
+            with open(config_path, encoding="utf-8") as f:
+                cfg = _json.load(f)
+        except (FileNotFoundError, _json.JSONDecodeError):
+            cfg = {}
+        cfg.setdefault("ui", {})["theme"] = name
+        try:
+            with open(config_path, "w", encoding="utf-8") as f:
+                _json.dump(cfg, f, indent=2)
+        except Exception:
+            pass
+
+    def _persist_obsidian_config(self, vault_path: str) -> None:
+        """Write the obsidian.vault_path key back to config.json."""
+        import json as _json
+        config_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), "config.json")
+        try:
+            with open(config_path, encoding="utf-8") as f:
+                cfg = _json.load(f)
+        except (FileNotFoundError, _json.JSONDecodeError):
+            cfg = {}
+        cfg.setdefault("obsidian", {})["vault_path"] = vault_path
+        try:
+            with open(config_path, "w", encoding="utf-8") as f:
+                _json.dump(cfg, f, indent=2)
+        except Exception:
+            pass
 
     # ------------------------------------------------------------------ manual shortcuts
 
@@ -4699,6 +4868,8 @@ class VibeCLIApp(App[None]):
                 "show_editor":        self._show_editor,
                 "show_terminal":      self._show_terminal,
                 "show_graph":         self._show_graph,
+                "show_obsidian":      self._show_obsidian,
+                "ui_theme":           self._ui_theme,
             },
             "projects": projects_state,
             "detached": self._detached,
@@ -4725,10 +4896,18 @@ class VibeCLIApp(App[None]):
         self._perm_mode   = g.get("permission_mode",  self._perm_mode)
         self._agent_type  = g.get("agent_type",        self._agent_type)
         self._effort_mode = g.get("effort_mode",       self._effort_mode)
-        self._show_files  = g.get("show_files",        False)
-        self._show_editor = g.get("show_editor",       False)
-        self._show_terminal = g.get("show_terminal",   False)
-        self._show_graph  = g.get("show_graph",        False)
+        # Theme: session.json is updated immediately on every theme change
+        # (via SessionStore.patch_global), so it is always authoritative.
+        # Fall back to the config.json value (already in self._ui_theme) only
+        # when the session has no theme entry.
+        session_theme = g.get("ui_theme")
+        if session_theme:
+            self._ui_theme = session_theme
+        self._show_files    = g.get("show_files",    False)
+        self._show_editor   = g.get("show_editor",   False)
+        self._show_terminal = g.get("show_terminal", False)
+        self._show_graph    = g.get("show_graph",    False)
+        self._show_obsidian = g.get("show_obsidian", False)
 
         self.query_one("#status-bar", StatusBar).update_agent(self._agent_type)
         self.query_one("#status-bar", StatusBar).update_perm(self._perm_mode)
@@ -4778,13 +4957,5 @@ class VibeCLIApp(App[None]):
 # helpers
 # ---------------------------------------------------------------------------
 
-def _language_for(path: str) -> str | None:
-    ext = Path(path).suffix.lower()
-    return {
-        ".py": "python", ".js": "javascript", ".ts": "typescript",
-        ".tsx": "typescript", ".jsx": "javascript", ".go": "go",
-        ".rs": "rust", ".md": "markdown", ".json": "json",
-        ".toml": "toml", ".yaml": "yaml", ".yml": "yaml",
-        ".html": "html", ".css": "css", ".sh": "bash",
-        ".bash": "bash", ".c": "c", ".cpp": "cpp",
-    }.get(ext)
+# _CUSTOM_THEMES, _APP_TO_PYGMENTS_THEME imported from ui.themes
+

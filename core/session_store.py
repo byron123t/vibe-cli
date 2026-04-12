@@ -13,7 +13,8 @@ Schema (version 1)
     "show_files": false,
     "show_editor": false,
     "show_terminal": false,
-    "show_graph": false
+    "show_graph": false,
+    "ui_theme": "textual-dark"
   },
   "projects": {
     "/abs/path/to/project": {
@@ -51,6 +52,22 @@ class SessionStore:
         os.makedirs(os.path.dirname(SESSION_FILE), exist_ok=True)
         with open(SESSION_FILE, "w") as f:
             json.dump(state, f, indent=2)
+
+    def patch_global(self, **kwargs) -> None:
+        """Update individual keys inside the ``global`` section without
+        rewriting the full session.  Creates the file if it doesn't exist.
+        Silently ignores any I/O errors so callers never need to handle them.
+        """
+        try:
+            data = self.load()
+            if not data:
+                data = {"version": 1, "global": {}}
+            data.setdefault("global", {}).update(kwargs)
+            os.makedirs(os.path.dirname(SESSION_FILE), exist_ok=True)
+            with open(SESSION_FILE, "w") as f:
+                json.dump(data, f, indent=2)
+        except Exception:
+            pass
 
     def load(self) -> dict:
         if not os.path.isfile(SESSION_FILE):

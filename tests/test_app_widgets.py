@@ -393,9 +393,9 @@ async def test_editor_audio_mode_uses_sidecar_notes():
             assert meta.display is True
             ta = pilot.app.query_one("#ep-area", TextArea)
             assert "Audio notes" in ta.text or "#" in ta.text
-            ep.enter_edit_mode()
+            # TextArea is always editable for audio — write directly and save
             ta.text = "0:00 — intro\n"
-            ep.exit_edit_mode()
+            ep.save()
         sidecar = _audio_annotation_path(audio)
         assert os.path.isfile(sidecar)
         with open(sidecar, encoding="utf-8") as f:
