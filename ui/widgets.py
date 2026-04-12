@@ -1377,18 +1377,21 @@ class EditorPanel(Static):
             meta.display = False
             meta.update("")
             label.update(
-                f" {os.path.basename(path)}  [dim]s=save · Esc=view · e=close[/dim]"
+                f" {os.path.basename(path)}  [dim]i=edit · e=close[/dim]"
             )
             try:
                 content = Path(path).read_text(errors="replace")
             except Exception as e:
                 content = f"[Error: {e}]"
+            # Pre-load into TextArea so edit mode is ready when `i` is pressed
             ta.load_text(content)
             _set_ta_language(ta, _language_for(path))
             ta.read_only = False
-            sc.display = False
-            ta.display = True
-            self._in_view_mode = False
+            ta.display = False
+            # Default to colorized Rich Syntax read-only view
+            self._render_to_view(content)
+            sc.display = True
+            self._in_view_mode = True
 
         self._start_lint()
 
@@ -1433,10 +1436,29 @@ class EditorPanel(Static):
         app_theme = getattr(self.app, "theme", "textual-dark")
         return _APP_TO_PYGMENTS_THEME.get(app_theme, "monokai")
 
+    _LIGHT_THEMES = frozenset({
+        "textual-light", "atom-one-light", "catppuccin-latte", "rose-pine-dawn",
+        "solarized-light", "ayu-light", "paper", "everforest-light", "warm-light",
+    })
+
+    def _ta_theme(self) -> str:
+        """Return a Textual TextArea theme name matching the current app theme.
+
+        Available built-ins: monokai, dracula, vscode_dark, github_light, css.
+        """
+        app_theme = getattr(self.app, "theme", "textual-dark")
+        if app_theme == "dracula":
+            return "dracula"
+        if app_theme in self._LIGHT_THEMES:
+            return "github_light"
+        return "vscode_dark"
+
     def switch_to_view_mode(self) -> None:
         """Save content and display the colorized Rich Syntax read-only view."""
         ta  = self.query_one("#ep-area",   TextArea)
         sc  = self.query_one("#ep-scroll", ScrollableContainer)
+        # Capture TextArea scroll position (cursor row ≈ first visible line)
+        saved_scroll_y = ta.scroll_y
         self._render_to_view(ta.text)
         ta.display = False
         sc.display = True
@@ -1445,14 +1467,24 @@ class EditorPanel(Static):
             label = self.query_one("#ep-label", Label)
             label.update(
                 f" {os.path.basename(self._current_path)}  "
-                "[dim]e=close[/dim]"
+                "[dim]i=edit · e=close[/dim]"
             )
+        # Restore scroll so the same lines stay in view
+        def _restore_scroll() -> None:
+            sc.scroll_to(y=saved_scroll_y, animate=False)
+        self.call_after_refresh(_restore_scroll)
 
     def enter_edit_mode(self) -> None:
         """Switch from the colorized view back to the editable TextArea."""
         ta  = self.query_one("#ep-area",   TextArea)
         sc  = self.query_one("#ep-scroll", ScrollableContainer)
+        # Capture the read-only view's scroll offset before hiding it
+        saved_scroll_y = sc.scroll_y
         sc.display = False
+        try:
+            ta.theme = self._ta_theme()
+        except Exception:
+            pass
         ta.display = True
         self._in_view_mode = False
         if self._current_path:
@@ -1461,6 +1493,10 @@ class EditorPanel(Static):
                 f" {os.path.basename(self._current_path)}  "
                 "[dim]s=save · Esc=view · e=close[/dim]"
             )
+        # Restore scroll position after the TextArea has been laid out
+        def _restore_scroll() -> None:
+            ta.scroll_to(y=saved_scroll_y, animate=False)
+        self.call_after_refresh(_restore_scroll)
         ta.focus()
 
     # ------------------------------------------------------------------ linting

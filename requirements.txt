@@ -18,3 +18,4 @@ Pillow>=10.0.0
 pyte>=0.8.0
 ptyprocess>=0.7.0
 websockets>=12.0
+redis>=4.0.0

@@ -3,7 +3,7 @@ import os
 import json
 import pytest
 
-from core.session_store import SessionStore, MAX_OUTPUT_LINES
+from core.session_store import SessionStore, MAX_OUTPUT_LINES, DEFAULT_THEME
 from graph.personalization_graph import PersonalizationGraph
 from personalization.predictor import Predictor
 
@@ -61,7 +61,9 @@ class TestSessionStore:
         with open(path, "w", encoding="utf-8") as f:
             json.dump({"version": 99, "data": "old"}, f)
         result = s.load()
-        assert result["global"]["ui_theme"] == "textual-dark"
+        # Wrong-version file has no explicit global state, so ui_theme is omitted
+        # to let config.json win at startup rather than injecting the hardcoded default.
+        assert "ui_theme" not in result["global"]
         assert result["projects"] == {}
 
     def test_save_complex_nested_state(self, store):

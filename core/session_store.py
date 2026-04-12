@@ -1,4 +1,12 @@
-"""SessionStore — persist and restore the full UI session state."""
+"""SessionStore — persist and restore the full UI session state.
+
+Storage backends (in priority order):
+  1. Redis  — low-latency, survives crashes, no fsync overhead.
+             Enabled when redis-py is installed and the server is reachable.
+             Key: ``vibe:session``  (no TTL — persists indefinitely).
+  2. File   — JSON file under the vault directory (always written as a backup
+             even when Redis is active, so the vault remains portable).
+"""
 from __future__ import annotations
 
 import copy
@@ -14,8 +22,6 @@ def session_path_for_vault(vault_root: str) -> str:
 
 
 # Default when SessionStore() is constructed without a path (tests, scripts).
-# The app uses session_path_for_vault(config vault root) so session lives with
-# the same vault as notes and personalization data.
 SESSION_FILE = os.path.join(
     os.path.dirname(__file__), "..", "vault", "user", "session.json"
 )
@@ -23,6 +29,9 @@ SESSION_FILE = os.path.join(
 SESSION_VERSION = 1
 MAX_OUTPUT_LINES = 500
 MAX_PROMPT_HISTORY = 500
+
+DEFAULT_THEME = "textual-dark"
+REDIS_KEY = "vibe:session"
 
 DEFAULT_GLOBAL_STATE = {
     "active_project_idx": 0,
@@ -34,15 +43,44 @@ DEFAULT_GLOBAL_STATE = {
     "show_terminal": False,
     "show_graph": False,
     "show_obsidian": False,
-    "ui_theme": "textual-dark",
+    # ui_theme is intentionally absent — it is handled separately in normalize()
+    # so the loop never injects "textual-dark" as a default that overwrites a saved choice.
 }
 
 
-class SessionStore:
-    """Persistence wrapper for the app session file."""
+def _try_connect_redis(url: str) -> "Any | None":
+    """Attempt to connect to Redis; return a client or None on any failure."""
+    try:
+        import redis  # type: ignore
+        client = redis.from_url(url, socket_connect_timeout=1, socket_timeout=2)
+        client.ping()
+        return client
+    except Exception:
+        return None
 
-    def __init__(self, path: str | None = None) -> None:
+
+class SessionStore:
+    """Persistence wrapper for the app session file.
+
+    Parameters
+    ----------
+    path:
+        Path to the JSON file.  Falls back to ``SESSION_FILE`` when omitted.
+    redis_url:
+        Redis connection URL (default ``redis://localhost:6379/0``).
+        Pass ``None`` to disable Redis entirely.
+    """
+
+    def __init__(self, path: str | None = None, redis_url: str | None = "redis://localhost:6379/0") -> None:
         self.path = path or SESSION_FILE
+        self._redis = None
+        if redis_url:
+            self._redis = _try_connect_redis(redis_url)
+
+    @property
+    def backend(self) -> str:
+        """Return ``'redis'`` or ``'file'`` — the active primary backend."""
+        return "redis" if self._redis is not None else "file"
 
     @classmethod
     def default_state(cls) -> dict[str, Any]:
@@ -54,9 +92,12 @@ class SessionStore:
             "prompt_history": [],
         }
 
+    # ---------------------------------------------------------------------- public API
+
     def save(self, state: dict[str, Any]) -> dict[str, Any]:
         normalized = self.normalize(state)
-        self._write(normalized)
+        self._write(normalized)          # always write file (portable backup)
+        self._redis_set(normalized)      # no-op when Redis is unavailable
         return normalized
 
     def patch_global(self, **kwargs: Any) -> dict[str, Any]:
@@ -65,20 +106,18 @@ class SessionStore:
         return self.save(state)
 
     def load(self) -> dict[str, Any]:
-        raw = self._read_raw()
+        raw = self._redis_get() or self._read_raw()
         if raw is None:
             return {}
         return self.normalize(raw)
+
+    # ---------------------------------------------------------------------- normalisation
 
     def normalize(self, state: Any) -> dict[str, Any]:
         base = self.default_state()
         if not isinstance(state, dict):
             return base
 
-        # Distinguish "no global key in file" from "global object without ui_theme".
-        # The palette writes ui.theme to config.json immediately; older session.json
-        # files omitted ui_theme. Filling the default here made session override config
-        # on every launch. Only omit ui_theme when global was explicitly saved without it.
         raw_global = state.get("global")
         if isinstance(raw_global, dict):
             global_state = raw_global
@@ -97,8 +136,13 @@ class SessionStore:
                 elif isinstance(default, str):
                     base["global"][key] = value if isinstance(value, str) and value else default
 
-            if global_explicit and "ui_theme" not in global_state:
-                base["global"].pop("ui_theme", None)
+            # ui_theme is NOT in DEFAULT_GLOBAL_STATE so the loop never touches it.
+            # Copy it only when the file explicitly stored it; otherwise leave it
+            # absent so config.json (or the app default) wins at startup.
+            if global_explicit:
+                theme_val = global_state.get("ui_theme")
+                if isinstance(theme_val, str) and theme_val:
+                    base["global"]["ui_theme"] = theme_val
 
         projects = state.get("projects", {})
         if isinstance(projects, dict):
@@ -168,6 +212,35 @@ class SessionStore:
         normalized["output"] = self.cap_output(output.splitlines())
         return normalized
 
+    # ---------------------------------------------------------------------- Redis helpers
+
+    def _redis_set(self, state: dict[str, Any]) -> None:
+        if self._redis is None:
+            return
+        try:
+            self._redis.set(REDIS_KEY, json.dumps(state))
+        except Exception:
+            pass
+
+    def _redis_get(self) -> dict[str, Any] | None:
+        if self._redis is None:
+            return None
+        try:
+            data = self._redis.get(REDIS_KEY)
+            if data is None:
+                return None
+            parsed = json.loads(data)
+            if not isinstance(parsed, dict):
+                return None
+            version = parsed.get("version")
+            if version not in (None, SESSION_VERSION):
+                return None
+            return parsed
+        except Exception:
+            return None
+
+    # ---------------------------------------------------------------------- file helpers
+
     def _read_raw(self) -> dict[str, Any] | None:
         if not os.path.isfile(self.path):
             return None
@@ -199,6 +272,8 @@ class SessionStore:
             except OSError:
                 pass
             raise
+
+    # ---------------------------------------------------------------------- utilities
 
     @staticmethod
     def cap_output(lines: list[str]) -> str:

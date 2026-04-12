@@ -71,7 +71,7 @@ from textual.widgets import (
 from textual import work, on
 
 from core.project_manager import Project, ProjectManager
-from core.session_store import SessionStore, session_path_for_vault
+from core.session_store import SessionStore, session_path_for_vault, DEFAULT_THEME as _DEFAULT_THEME
 from terminal.agent_session import AgentSession
 from terminal.claude_session import ClaudeSession, PERMISSION_FLAGS
 from terminal.codex_session import CodexSession
@@ -204,7 +204,11 @@ class VibeCLIApp(_SlashCommandMixin, App[None]):
 
         vault_root   = config.get("vault", {}).get("root", "vault")
         self._vault  = MemoryVault(vault_root)
-        self._session_store = SessionStore(session_path_for_vault(self._vault.root))
+        redis_url = config.get("session", {}).get("redis_url", "redis://localhost:6379/0")
+        self._session_store = SessionStore(session_path_for_vault(self._vault.root), redis_url=redis_url)
+        # True once startup restore is complete; watch_theme only persists after this point.
+        self._session_ready: bool = False
+
 
         pers_path    = os.path.join(vault_root, "user", "personalization_graph.json")
         self._pers   = PersonalizationGraph(pers_path)
@@ -263,7 +267,18 @@ class VibeCLIApp(_SlashCommandMixin, App[None]):
         self._manual_shortcuts: list[str] = self._load_manual_shortcuts(vault_root)
 
         # UI theme — persisted to config.json under ui.theme
-        self._ui_theme: str = config.get("ui", {}).get("theme", "textual-dark")
+        self._ui_theme: str = config.get("ui", {}).get("theme", _DEFAULT_THEME)
+
+        # Register custom themes immediately so they are available before on_mount.
+        # This allows self.theme to be set reliably in __init__ and on_mount without
+        # needing call_after_refresh for the initial application.
+        for _t in _CUSTOM_THEMES:
+            self.register_theme(_t)
+        # Apply config theme now; session restore in on_mount will override if needed.
+        try:
+            self.theme = self._ui_theme
+        except Exception:
+            pass
 
         # Obsidian integration (opt-in via /obsidian <path> or config)
         self._obsidian_vault_path: str = config.get("obsidian", {}).get("vault_path", "")
@@ -303,12 +318,7 @@ class VibeCLIApp(_SlashCommandMixin, App[None]):
         yield ShortcutsBar(id="shortcuts-bar")
 
     async def on_mount(self) -> None:
-        # Register custom themes before session restore so they're available immediately
-        for _t in _CUSTOM_THEMES:
-            try:
-                self.register_theme(_t)
-            except Exception:
-                pass
+        # Custom themes are registered in __init__ — no need to re-register here.
 
         # Re-mount any SSH projects that were saved in projects.json
         self._remount_ssh_projects()
@@ -358,11 +368,15 @@ class VibeCLIApp(_SlashCommandMixin, App[None]):
         else:
             self._apply_layout()
 
+        # Session is fully loaded — subsequent theme changes are now persisted via watch_theme.
+        self._session_ready = True
+
         self._refresh_suggestions()
         self.query_one("#prompt-bar", PromptBar).manual_shortcuts = list(self._manual_shortcuts)
 
-        # Apply the restored session/config theme after the first render cycle so
-        # Textual's own CSS initialisation doesn't overwrite it.
+        # Belt-and-suspenders: re-apply the theme after the first render cycle in
+        # case Textual's CSS initialisation resets it.  The theme has already been
+        # set synchronously in __init__ (config) and _restore_session (session).
         self.call_after_refresh(self._apply_persisted_theme)
 
         # Focus the agent panel → command mode
@@ -453,6 +467,14 @@ class VibeCLIApp(_SlashCommandMixin, App[None]):
         # All remaining shortcuts only apply in command mode
         if in_input or in_edit:
             return
+
+        # ── i: enter edit mode (editor visible in read-only view) ────────────
+        if char == "i" and self._show_editor:
+            ep = self.query_one("#editor-panel", EditorPanel)
+            if ep._in_view_mode and not ep._audio_mode:
+                ep.enter_edit_mode()
+                event.stop()
+                return
 
         # ── p: play audio when editor is open on an audio file ─────────────
         if char == "p" and self._show_editor:
@@ -594,6 +616,7 @@ class VibeCLIApp(_SlashCommandMixin, App[None]):
         else:
             # Switched away from OpenClaw — stop gateway client
             self._stop_gateway_client()
+        self._session_store.patch_global(agent_type=self._agent_type)
 
     def action_cycle_effort(self) -> None:
         idx = _EFFORT_CYCLE.index(self._effort_mode) if self._effort_mode in _EFFORT_CYCLE else 1
@@ -601,6 +624,7 @@ class VibeCLIApp(_SlashCommandMixin, App[None]):
         self.query_one("#status-bar", StatusBar).update_effort(self._effort_mode)
         label, _ = _EFFORT_LABELS[self._effort_mode]
         self.notify(f"Effort → {label}", timeout=3)
+        self._session_store.patch_global(effort_mode=self._effort_mode)
 
     def _toggle_git_commit(self) -> None:
         self._auto_commit = not self._auto_commit
@@ -667,6 +691,7 @@ class VibeCLIApp(_SlashCommandMixin, App[None]):
             "[dim](applied to all open projects)[/dim]",
             timeout=4,
         )
+        self._session_store.patch_global(permission_mode=self._perm_mode)
 
     # ------------------------------------------------------------------ project actions
 
@@ -851,6 +876,7 @@ class VibeCLIApp(_SlashCommandMixin, App[None]):
         self._apply_layout()
         if self._show_files:
             self.query_one("#file-browser", FileBrowserPanel).focus_tree()
+        self._session_store.patch_global(show_files=self._show_files)
 
     def action_toggle_editor(self) -> None:
         ep = self.query_one("#editor-panel", EditorPanel)
@@ -862,16 +888,19 @@ class VibeCLIApp(_SlashCommandMixin, App[None]):
         else:
             self._show_editor = not self._show_editor
             self._apply_layout()
+        self._session_store.patch_global(show_editor=self._show_editor)
 
     def action_toggle_graph(self) -> None:
         self._show_graph = not self._show_graph
         self._apply_layout()
+        self._session_store.patch_global(show_graph=self._show_graph)
 
     def action_toggle_terminal(self) -> None:
         self._show_terminal = not self._show_terminal
         self._apply_layout()
         if self._show_terminal:
             self.query_one("#terminal-panel", TerminalPanel).focus_input()
+        self._session_store.patch_global(show_terminal=self._show_terminal)
 
     def action_toggle_inbox(self) -> None:
         """Toggle the OpenClaw channel inbox panel."""
@@ -898,6 +927,7 @@ class VibeCLIApp(_SlashCommandMixin, App[None]):
         if self._show_obsidian:
             self._show_graph = False   # mutually exclusive full-screen views
         self._apply_layout()
+        self._session_store.patch_global(show_obsidian=self._show_obsidian, show_graph=self._show_graph)
 
     def action_open_palette(self) -> None:
         """Open the command palette (ctrl+p)."""
@@ -1122,6 +1152,7 @@ class VibeCLIApp(_SlashCommandMixin, App[None]):
             )
         self._refresh_suggestions()
         self.query_one("#agent-panel", AgentPanel).focus()
+        self._session_store.patch_global(active_project_idx=self._pm.active_idx)
 
     @on(FileBrowserPanel.FileSelected)
     def _file_browser_selected(self, event: FileBrowserPanel.FileSelected) -> None:
@@ -1152,8 +1183,8 @@ class VibeCLIApp(_SlashCommandMixin, App[None]):
         if not prompt:
             return
         self._history_add(prompt)
-        # Reset browse state for the PromptBar input after submission
         self._hist_browse.pop("pb-input", None)
+        self._save_session()
 
         # ── Slash commands ─────────────────────────────────────────────────
         if prompt.startswith("/"):
@@ -1769,22 +1800,32 @@ class VibeCLIApp(_SlashCommandMixin, App[None]):
     ) -> bool:
         if not isinstance(name, str) or not name:
             return False
+        if persist_config:
+            self._persist_theme_config(name)
         try:
-            self.theme = name
+            self.theme = name  # triggers watch_theme on success, which persists + syncs _ui_theme
         except Exception:
             if notify:
                 self.notify(f"Unknown theme: {name}", severity="warning", timeout=3)
-            if persist_config or persist_session:
-                self._ui_theme = "textual-dark"
             return False
-        self._ui_theme = name
-        if persist_config:
-            self._persist_theme_config(name)
-        if persist_session:
-            self._session_store.patch_global(ui_theme=name)
         if notify:
             self.notify(f"Theme: {name}", timeout=2)
         return True
+
+    def watch_theme(self, theme: str) -> None:
+        """Textual reactive watcher — called whenever self.theme is successfully changed.
+
+        This is the single place that syncs _ui_theme and persists the choice to
+        Redis/session.json.  It fires AFTER Textual has validated and applied the
+        theme, so only successfully applied themes are ever persisted.
+
+        The _session_ready guard prevents writes during app initialisation (before
+        the saved session has been loaded and applied).
+        """
+        self._ui_theme = theme
+        if not getattr(self, "_session_ready", False):
+            return
+        self._session_store.patch_global(ui_theme=theme)
 
     def _set_theme(self, name: str) -> None:
         """Switch the app theme live and persist it."""
@@ -1801,7 +1842,7 @@ class VibeCLIApp(_SlashCommandMixin, App[None]):
         try:
             with open(config_path, encoding="utf-8") as f:
                 cfg = _json.load(f)
-        except (FileNotFoundError, _json.JSONDecodeError):
+        except Exception:
             cfg = {}
         cfg.setdefault("ui", {})["theme"] = name
         try:
@@ -2038,10 +2079,7 @@ class VibeCLIApp(_SlashCommandMixin, App[None]):
             "detached": self._detached,
             "prompt_history": self._prompt_history[-500:],  # cap to 500 entries
         }
-        try:
-            self._session_store.save(state)
-        except Exception:
-            pass
+        self._session_store.save(state)
 
     def _restore_session(self, state: dict) -> None:
         """Rebuild agent widgets and UI state from a saved session dict."""
@@ -2065,7 +2103,13 @@ class VibeCLIApp(_SlashCommandMixin, App[None]):
         # when the session has no theme entry.
         session_theme = g.get("ui_theme")
         if session_theme:
-            self._ui_theme = session_theme
+            # watch_theme will update self._ui_theme when the assignment below succeeds.
+            # _session_ready is still False here so watch_theme will NOT write back to
+            # the store — this is a pure restore, not a user-initiated change.
+            try:
+                self.theme = session_theme
+            except Exception:
+                pass
         self._show_files    = g.get("show_files",    False)
         self._show_editor   = g.get("show_editor",   False)
         self._show_terminal = g.get("show_terminal", False)
