@@ -3,13 +3,13 @@ ui/screens/command_palette.py — CommandPaletteScreen modal.
 """
 from __future__ import annotations
 
+from textual import on
 from textual.app import ComposeResult
 from textual.binding import Binding
 from textual.containers import ScrollableContainer, Vertical
 from textual.events import Key
 from textual.screen import ModalScreen
 from textual.widgets import Input, Label
-from textual import on
 
 
 class CommandPaletteScreen(ModalScreen):
@@ -55,11 +55,6 @@ class CommandPaletteScreen(ModalScreen):
         background: $accent-darken-1;
         color: $accent-lighten-2;
     }
-    .cp-separator {
-        color: $text-disabled;
-        height: 1;
-        padding: 0 1;
-    }
     .cp-empty {
         color: $text-muted;
         text-align: center;
@@ -77,31 +72,20 @@ class CommandPaletteScreen(ModalScreen):
         Binding("escape", "cancel", show=False),
     ]
 
-    _HINT_NORMAL  = "↑↓ navigate  ↵ execute  Esc close"
-    _HINT_CONFIRM = "[bold]↵[/bold] Keep theme   [bold]⌫[/bold] Try another   [bold]Esc[/bold] Browse all"
+    _HINT_NORMAL = "↑↓ navigate  ↵ execute  Esc close"
 
     def __init__(
         self,
         commands: "list[tuple[str, str, str | None]]",
         **kwargs,
     ) -> None:
-        """
-        *commands* is a list of (name, description, id_key) tuples.
-        ``id_key`` is a string key returned on dismiss so the caller can
-        identify which command was chosen (None for separators).
-        """
         super().__init__(**kwargs)
-        self._all:      list[tuple[str, str, str | None]] = commands
+        self._all: list[tuple[str, str, str | None]] = commands
         self._filtered: list[tuple[str, str, str | None]] = [
-            c for c in commands if c[2] is not None
+            command for command in commands if command[2] is not None
         ]
-        self._cursor:            int  = 0
-        self._confirm_mode:      bool = False
-        self._confirm_key:       str  = ""
-        self._original_theme:    str  = ""
-        # Guard that prevents _on_filter from overwriting _filtered/_cursor
-        # when we're programmatically filtering to the theme picker.
-        self._theme_picker_mode: bool = False
+        self._cursor = 0
+        self._render_nonce = 0
 
     def compose(self) -> ComposeResult:
         with Vertical(id="cp-container"):
@@ -111,147 +95,86 @@ class CommandPaletteScreen(ModalScreen):
             yield Label(self._HINT_NORMAL, id="cp-hint")
 
     def on_mount(self) -> None:
-        self._original_theme = getattr(self.app, "theme", "textual-dark")
         self._rebuild_list()
         self.query_one("#cp-input", Input).focus()
 
-    # ── filtering ────────────────────────────────────────────────────────────
+    def _set_app_theme(self, theme_name: str) -> None:
+        apply_theme = getattr(self.app, "_apply_theme", None)
+        if callable(apply_theme):
+            apply_theme(
+                theme_name,
+                persist_config=True,
+                persist_session=True,
+                notify=False,
+            )
+            return
+        if theme_name in self.app.available_themes:
+            try:
+                self.app.theme = theme_name
+            except Exception:
+                pass
 
     @on(Input.Changed, "#cp-input")
     def _on_filter(self, event: Input.Changed) -> None:
-        # Suppress the next automatic filter event when we're programmatically
-        # restoring the theme picker so _filtered / _cursor aren't overwritten.
-        if self._theme_picker_mode:
-            self._theme_picker_mode = False
-            return
-        q = event.value.strip().lower()
-        if q:
+        query = event.value.strip().lower()
+        if query:
             self._filtered = [
                 (name, desc, key)
                 for name, desc, key in self._all
-                if key is not None and (q in name.lower() or q in desc.lower())
+                if key is not None and (query in name.lower() or query in desc.lower())
             ]
         else:
-            self._filtered = [c for c in self._all if c[2] is not None]
+            self._filtered = [command for command in self._all if command[2] is not None]
         self._cursor = 0
         self._rebuild_list()
 
+    @on(Input.Submitted, "#cp-input")
+    def _on_submit(self, event: Input.Submitted) -> None:
+        event.stop()
+        self._execute()
+
     def _rebuild_list(self) -> None:
         sc = self.query_one("#cp-list", ScrollableContainer)
-        for w in list(sc.children):
-            w.remove()
+        self._render_nonce += 1
+        for child in list(sc.children):
+            child.remove()
         if not self._filtered:
             sc.mount(Label("(no matches)", classes="cp-empty"))
             return
         for i, (name, desc, _) in enumerate(self._filtered):
-            is_active  = name.startswith("✓")
+            is_active = name.startswith("✓")
             is_focused = i == self._cursor
             classes = "cp-item"
             if is_active:
                 classes += " cp-item-active"
             if is_focused:
                 classes += " cp-item-focused"
-            if is_active:
-                display_name = f"[bold]✓ {name[2:]}[/bold]"
-            else:
-                display_name = f"[bold]  {name[2:]}[/bold]"
+            display_name = f"[bold]{name}[/bold]"
             text = f"{display_name}  [dim]{desc}[/dim]"
-            sc.mount(Label(text, id=f"cp-item-{i}", classes=classes))
+            sc.mount(Label(text, id=self._item_id(i), classes=classes))
 
-    # ── navigation ───────────────────────────────────────────────────────────
+    def _item_id(self, index: int) -> str:
+        return f"cp-item-{self._render_nonce}-{index}"
 
     def _move_cursor(self, delta: int) -> None:
         if not self._filtered:
             return
-        old          = self._cursor
+        old = self._cursor
         self._cursor = (self._cursor + delta) % len(self._filtered)
         try:
-            self.query_one(f"#cp-item-{old}", Label).remove_class("cp-item-focused")
+            self.query_one(f"#{self._item_id(old)}", Label).remove_class("cp-item-focused")
         except Exception:
             pass
         try:
-            item = self.query_one(f"#cp-item-{self._cursor}", Label)
+            item = self.query_one(f"#{self._item_id(self._cursor)}", Label)
             item.add_class("cp-item-focused")
             item.scroll_visible(animate=False)
         except Exception:
             pass
 
-    # ── confirm mode helpers ─────────────────────────────────────────────────
-
-    def _enter_confirm(self, key: str, theme_name: str) -> None:
-        """Apply *theme_name* immediately and switch to confirm mode."""
-        if theme_name in self.app.available_themes:
-            try:
-                self.app.theme = theme_name
-            except Exception:
-                pass
-        self._confirm_mode = True
-        self._confirm_key  = key
-        inp = self.query_one("#cp-input", Input)
-        inp.value    = f"✓  {theme_name}"
-        inp.disabled = True
-        self.query_one("#cp-hint", Label).update(self._HINT_CONFIRM)
-
-    def _exit_confirm(self, show_themes: bool = False) -> None:
-        """Revert theme and return to browse mode.
-
-        If *show_themes* is True, pre-filter the list to theme entries and
-        place the cursor on the entry that was just previewed so the user can
-        quickly pick a different theme.  Otherwise (Escape) the full list is
-        restored.
-        """
-        prev_key           = self._confirm_key
-        self._confirm_mode = False
-        self._confirm_key  = ""
-        try:
-            if self.app.theme != self._original_theme:
-                self.app.theme = self._original_theme
-        except Exception:
-            pass
-        inp = self.query_one("#cp-input", Input)
-        inp.disabled = False
-        self.query_one("#cp-hint", Label).update(self._HINT_NORMAL)
-        if show_themes:
-            self._filtered = [
-                (name, desc, key)
-                for name, desc, key in self._all
-                if key is not None and ("theme" in name.lower() or "theme" in desc.lower())
-            ]
-            self._cursor = 0
-            for i, (_, _, key) in enumerate(self._filtered):
-                if key == prev_key:
-                    self._cursor = i
-                    break
-            # Set the flag before updating inp.value so the resulting
-            # Input.Changed event is swallowed and doesn't reset _cursor.
-            self._theme_picker_mode = True
-            inp.value = "theme"
-        else:
-            inp.value    = ""
-            self._filtered = [c for c in self._all if c[2] is not None]
-            self._cursor   = 0
-        self._rebuild_list()
-        try:
-            self.query_one(f"#cp-item-{self._cursor}", Label).scroll_visible(animate=False)
-        except Exception:
-            pass
-        inp.focus()
-
-    # ── key handling ─────────────────────────────────────────────────────────
-
     def on_key(self, event: Key) -> None:
         key = event.key
-        if self._confirm_mode:
-            if key == "enter":
-                event.stop()
-                self.dismiss(self._confirm_key)
-            elif key in ("backspace", "delete"):
-                event.stop()
-                self._exit_confirm(show_themes=True)
-            elif key == "escape":
-                event.stop()
-                self._exit_confirm()
-            return
+        input_focused = self.app.focused is self.query_one("#cp-input", Input)
         if key == "up":
             self._move_cursor(-1)
             event.prevent_default()
@@ -261,6 +184,8 @@ class CommandPaletteScreen(ModalScreen):
             event.prevent_default()
             event.stop()
         elif key == "enter":
+            if input_focused:
+                return
             self._execute()
             event.stop()
         elif key == "escape":
@@ -272,12 +197,10 @@ class CommandPaletteScreen(ModalScreen):
             return
         _, _, key = self._filtered[self._cursor]
         if key and key.startswith("theme:"):
-            self._enter_confirm(key, key[len("theme:"):])
+            self._set_app_theme(key[len("theme:"):])
+            self.dismiss(None)
         else:
             self.dismiss(key)
 
     def action_cancel(self) -> None:
-        if self._confirm_mode:
-            self._exit_confirm()
-        else:
-            self.dismiss(None)
+        self.dismiss(None)

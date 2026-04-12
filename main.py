@@ -68,7 +68,7 @@ def main() -> None:
             else:
                 print(f"  [!] Not a directory, skipping: {path}")
 
-    app = VibeCLIApp(config)
+    app = VibeCLIApp(config, config_path=config_path)
     app.run()
 
 

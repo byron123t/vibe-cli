@@ -65,6 +65,162 @@ async def test_terminal_panel_hidden_by_default():
         assert tp.display is False
 
 
+async def test_restores_theme_from_session(monkeypatch, tmp_path):
+    from core.session_store import SessionStore, session_path_for_vault
+    from terminal.approval_server import ApprovalServer
+    from ui.app import VibeCLIApp
+
+    vault = str(tmp_path / "vault")
+    session_path = session_path_for_vault(vault)
+
+    async def _noop_start(self):
+        self._port = 0
+
+    monkeypatch.setattr(ApprovalServer, "start", _noop_start)
+    monkeypatch.setattr(VibeCLIApp, "_persist_theme_config", lambda self, name: None)
+
+    cfg = _config(vault)
+
+    app = VibeCLIApp(cfg)
+    async with app.run_test() as pilot:
+        app._set_theme("dracula")
+        app._save_session()
+        await pilot.pause()
+
+    restored = VibeCLIApp(cfg)
+    async with restored.run_test() as pilot:
+        await pilot.pause()
+        assert restored._ui_theme == "dracula"
+        assert restored.theme == "dracula"
+        assert SessionStore(session_path).load()["global"]["ui_theme"] == "dracula"
+
+
+async def test_palette_theme_selection_persists_immediately(monkeypatch, tmp_path):
+    from core.session_store import SessionStore, session_path_for_vault
+    from terminal.approval_server import ApprovalServer
+    from ui.app import VibeCLIApp
+    from ui.screens.command_palette import CommandPaletteScreen
+
+    vault = str(tmp_path / "vault")
+    session_path = session_path_for_vault(vault)
+
+    async def _noop_start(self):
+        self._port = 0
+
+    monkeypatch.setattr(ApprovalServer, "start", _noop_start)
+    monkeypatch.setattr(VibeCLIApp, "_persist_theme_config", lambda self, name: None)
+
+    app = VibeCLIApp(_config(vault))
+    async with app.run_test() as pilot:
+        app.action_open_palette()
+        await pilot.pause()
+        screen = app.screen_stack[-1]
+        assert isinstance(screen, CommandPaletteScreen)
+        screen._set_app_theme("dracula")
+        screen.dismiss(None)
+        await pilot.pause()
+        assert app._ui_theme == "dracula"
+        assert app.theme == "dracula"
+        assert SessionStore(session_path).load()["global"]["ui_theme"] == "dracula"
+
+async def test_palette_enter_from_input_selects_theme_and_closes(monkeypatch, tmp_path):
+    from core.session_store import SessionStore, session_path_for_vault
+    from terminal.approval_server import ApprovalServer
+    from textual.widgets import Input
+    from ui.app import VibeCLIApp
+    from ui.screens.command_palette import CommandPaletteScreen
+
+    vault = str(tmp_path / "vault")
+    session_path = session_path_for_vault(vault)
+
+    async def _noop_start(self):
+        self._port = 0
+
+    monkeypatch.setattr(ApprovalServer, "start", _noop_start)
+    monkeypatch.setattr(VibeCLIApp, "_persist_theme_config", lambda self, name: None)
+
+    app = VibeCLIApp(_config(vault))
+    async with app.run_test() as pilot:
+        app.action_open_palette()
+        await pilot.pause()
+        screen = app.screen_stack[-1]
+        assert isinstance(screen, CommandPaletteScreen)
+
+        inp = screen.query_one("#cp-input", Input)
+        inp.value = "dracula"
+        await pilot.pause()
+
+        await pilot.press("enter")
+        await pilot.pause()
+        assert not isinstance(app.screen_stack[-1], CommandPaletteScreen)
+        assert app._ui_theme == "dracula"
+        assert app.theme == "dracula"
+        assert SessionStore(session_path).load()["global"]["ui_theme"] == "dracula"
+
+
+async def test_config_theme_used_when_session_global_omits_ui_theme(monkeypatch, tmp_path):
+    """Legacy session.json without ui_theme must not override ui.theme from config.json."""
+    import json
+    from core.session_store import session_path_for_vault
+    from terminal.approval_server import ApprovalServer
+    from ui.app import VibeCLIApp
+
+    vault = str(tmp_path / "vault")
+    session_path = session_path_for_vault(vault)
+    os.makedirs(os.path.dirname(session_path), exist_ok=True)
+
+    async def _noop_start(self):
+        self._port = 0
+
+    monkeypatch.setattr(ApprovalServer, "start", _noop_start)
+
+    with open(session_path, "w", encoding="utf-8") as f:
+        json.dump(
+            {"version": 1, "global": {"show_files": False, "show_editor": False}},
+            f,
+        )
+
+    cfg = _config(str(tmp_path / "vault"))
+    cfg.setdefault("ui", {})["theme"] = "dracula"
+
+    async with VibeCLIApp(cfg).run_test() as pilot:
+        await pilot.pause()
+        assert pilot.app._ui_theme == "dracula"
+        assert pilot.app.theme == "dracula"
+
+
+async def test_theme_persist_writes_to_passed_config_path(monkeypatch, tmp_path):
+    """Theme must update the same config file main.py loaded (--config), not ui/../config.json only."""
+    import json
+    from terminal.approval_server import ApprovalServer
+    from ui.app import VibeCLIApp
+
+    vault = tmp_path / "vault"
+    cfg_path = tmp_path / "alt-config.json"
+    cfg_path.write_text(
+        json.dumps(
+            {
+                "vault": {"root": str(vault)},
+                "ui": {},
+                "claude": {"model": "claude-sonnet-4-6"},
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    async def _noop_start(self):
+        self._port = 0
+
+    monkeypatch.setattr(ApprovalServer, "start", _noop_start)
+
+    cfg = json.loads(cfg_path.read_text(encoding="utf-8"))
+    async with VibeCLIApp(cfg, config_path=str(cfg_path)).run_test() as pilot:
+        pilot.app._set_theme("dracula")
+        await pilot.pause()
+
+    assert json.loads(cfg_path.read_text(encoding="utf-8"))["ui"]["theme"] == "dracula"
+
+
 # ---------------------------------------------------------------------------
 # Keyboard navigation
 # ---------------------------------------------------------------------------
@@ -209,7 +365,8 @@ async def test_A_cycles_through_all_agents():
         await pilot.pause()
         start = app._agent_type
         seen = {start}
-        for _ in range(3):
+        # Cycle through all 4 agent types (claude, codex, cursor, openclaw) back to start
+        for _ in range(4):
             await pilot.press("A")
             await pilot.pause()
             seen.add(app._agent_type)

@@ -61,6 +61,7 @@ class DirectoryPickerScreen(ModalScreen):
         self._tree_root  = os.path.expanduser("~")
         self._input_init = start_path or self._tree_root
         self._ssh_mode   = False   # False = local, True = SSH
+        self._syncing_input = False  # True while node highlight is writing the input
 
     def compose(self) -> ComposeResult:
         with Container(id="dp-container"):
@@ -131,10 +132,16 @@ class DirectoryPickerScreen(ModalScreen):
         data = event.node.data
         if data is not None:
             path = getattr(data, "path", data)
+            self._syncing_input = True
             self.query_one("#dp-input", Input).value = str(path)
 
     @on(Input.Changed, "#dp-input")
     def _input_changed(self, event: Input.Changed) -> None:
+        # Ignore changes written by _node_highlighted — those come from tree
+        # navigation (arrow keys) and must not re-root the tree.
+        if self._syncing_input:
+            self._syncing_input = False
+            return
         path = os.path.expanduser(event.value.strip())
         if os.path.isdir(path):
             self.query_one("#dp-tree", DirectoryTree).path = Path(path)

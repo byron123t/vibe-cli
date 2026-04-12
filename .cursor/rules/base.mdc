@@ -1,8 +1,3 @@
----
-alwaysApply: true
-description: "Core project conventions"
----
-
 # vibe-cli — Keyboard-First Multi-Project AI Coding Terminal
 
 ## What It Is
@@ -22,16 +17,28 @@ vibe-cli/
 ├── requirements.txt
 │
 ├── ui/
-│   └── app.py                   # Entire TUI — all widgets and the App class
+│   ├── app.py                   # Entire TUI — all widgets and the App class
+│   ├── constants.py             # Shared UI constants
+│   ├── linting.py               # Code linting utilities
+│   ├── themes.py                # UI themes
+│   └── screens/
+│       ├── command_palette.py   # Command palette screen
+│       ├── directory_picker.py  # Filesystem navigator modal
+│       └── misc_screens.py      # Other modal screens
 │
 ├── core/
-│   └── project_manager.py       # Project list, persistence, active file tracking
+│   ├── project_manager.py       # Project list, persistence, active file tracking
+│   ├── session_store.py         # Persist/restore UI session state
+│   ├── openclaw_config.py       # OpenClaw configuration
+│   ├── openclaw_gateway.py      # Gateway client for OpenClaw
+│   └── ssh_mount.py             # SSH mounting for remote projects
 │
 ├── terminal/
 │   ├── agent_session.py         # AgentSession base class
 │   ├── claude_session.py        # `claude --print --output-format stream-json` wrapper
 │   ├── codex_session.py         # OpenAI Codex CLI wrapper
 │   ├── cursor_session.py        # Cursor CLI wrapper
+│   ├── openclaw_session.py      # OpenClaw CLI wrapper
 │   ├── pty_widget.py            # Real PTY terminal widget (pyte + ptyprocess)
 │   └── approval_server.py       # Async HTTP server for PreToolUse hook approvals
 │
@@ -49,7 +56,10 @@ vibe-cli/
 │   ├── linter.py                # Broken link + orphan detection
 │   ├── run_log.py               # Save agent run outputs as timestamped notes
 │   ├── user_profile.py          # Read/write user psychometric profile
-│   └── project_registry.py      # Known projects registry
+│   ├── project_registry.py      # Known projects registry
+│   ├── obsidian.py              # External Obsidian vault integration
+│   ├── brain_importer.py        # Import .md files into vault
+│   └── compactor.py             # Note compaction/optimization
 │
 ├── graph/
 │   ├── knowledge_graph.py       # networkx DiGraph from vault wikilinks
@@ -58,14 +68,26 @@ vibe-cli/
 ├── personalization/
 │   └── predictor.py             # Ranks actions by frequency × recency × project affinity
 │
-├── tests/
-│   ├── conftest.py
-│   ├── test_project_manager.py
-│   ├── test_suggestion_engine.py
-│   ├── test_claude_session.py
-│   └── test_app_widgets.py
-│
-└── unused/                      # Dead code (gesture/voice/pygame) — safe to delete
+└── tests/
+    ├── conftest.py
+    ├── test_project_manager.py
+    ├── test_suggestion_engine.py
+    ├── test_claude_session.py
+    ├── test_codex_session.py
+    ├── test_cursor_session.py
+    ├── test_agent_session.py
+    ├── test_app_widgets.py
+    ├── test_integration.py
+    ├── test_knowledge_graph.py
+    ├── test_linker_linter.py
+    ├── test_memory_vault.py
+    ├── test_note.py
+    ├── test_personalization_graph.py
+    ├── test_profile_analyzer.py
+    ├── test_refactoring.py
+    ├── test_run_log.py
+    ├── test_session_store_predictor.py
+    └── test_user_profile.py
 ```
 
 ---
@@ -76,6 +98,7 @@ vibe-cli/
 |---|---|---|
 | `ProjectTabBar` | `#tab-bar` | Top row of project tabs |
 | `StatusBar` | `#status-bar` | Agent type + permission mode indicator |
+| `ShortcutsBar` | `#shortcuts-bar` | Bottom bar showing available shortcuts |
 | `FileBrowserPanel` | `#file-browser` | DirectoryTree for current project (toggle: `f`) |
 | `EditorPanel` | `#editor-panel` | Read-only file viewer; `i` enters edit mode |
 | `AgentPanel` | `#agent-panel` | Per-project stacks of `AgentWidget`s |
@@ -84,6 +107,8 @@ vibe-cli/
 | `PermissionPrompt` | (inline) | Keyboard-navigable tool approval prompt |
 | `TerminalPanel` | `#terminal-panel` | Per-project real PTY terminal (toggle: `t`) |
 | `GraphPane` | `#graph-pane` | Memory/knowledge graph as navigable Tree (toggle: `m`) |
+| `OpenClawInboxPanel` | `#inbox-panel` | OpenClaw channels/inbox (toggle: `c`) |
+| `ObsidianPanel` | `#obsidian-panel` | External Obsidian vault browser (toggle: `O`) |
 | `PromptBar` | `#prompt-bar` | Suggestion row + prompt input |
 | `DirectoryPickerScreen` | (modal) | Filesystem navigator for opening projects |
 
@@ -110,18 +135,28 @@ vibe-cli is **modal** — like vim. Default is **command mode** where single key
 | `1`–`9` | Jump to project by number |
 | `n` or `Enter` | Open prompt (new agent) |
 | `x` | Cancel last running agent |
-| `d` | Dismiss last agent widget |
+| `d` | Detach last agent widget |
 | `j` / `k` | Scroll agent list down / up |
 | `f` | Toggle file browser |
 | `e` | Toggle editor panel |
-| `i` | Enter file edit mode |
+| `i` | Enter file edit mode (editor must be visible) |
 | `m` | Toggle memory / knowledge graph |
 | `t` | Toggle embedded terminal |
-| `r` | Run last shell command from agent output |
+| `r` | Open reattach menu (re-attach detached agents) |
+| `R` | Run last shell command from agent output |
 | `s` | Save file (edit mode only) |
-| `a` / `A` | Cycle agent type (Claude → Codex → Cursor) |
+| `A` | Cycle agent type (Claude → Codex → Cursor → OpenClaw) |
+| `E` | Cycle effort level |
 | `P` | Cycle permission mode (Safe → Accept Edits → Bypass) |
+| `G` | Toggle git auto-commit+push on/off |
+| `V` | Toggle verbose output default for new agents |
+| `B` | Import brain/memory folder into vault |
+| `c` | Toggle channels / inbox panel |
+| `O` | Toggle Obsidian vault panel |
 | `o` | Open project (directory picker modal) |
+| `ctrl+p` | Open command palette |
+| `ctrl+o` | Expand/collapse current agent output |
+| `ctrl+\` | Cycle permission mode |
 | `Backspace` / `,` | Back to command mode |
 | `q` | Quit |
 
@@ -144,6 +179,7 @@ Cycle with `A`. Supported:
 - **Claude** — `claude --print --verbose --output-format stream-json`
 - **Codex** — OpenAI Codex CLI
 - **Cursor** — Cursor CLI
+- **OpenClaw** — OpenClaw CLI
 
 ### Permission System (Safe Mode)
 
@@ -202,20 +238,37 @@ Runs in a background thread after every successful agent completion:
 
 ```json
 {
+  "agent": {
+    "type": "claude"
+  },
   "claude": {
     "model": "claude-sonnet-4-6",
+    "max_tokens": 65536,
     "permission_mode": "accept_edits"
   },
   "vault": {
     "root": "vault"
   },
   "git": {
-    "auto_commit": true,
-    "commit_message_prefix": "[vibe-cli] "
+    "auto_commit": false,
+    "commit_message_prefix": "[VibeCLI] "
   },
   "ui": {
     "max_agents_per_project": 8,
     "suggestions_count": 4
+  },
+  "hooks": {
+    "auto_docs": true
+  },
+  "personalization": {
+    "recency_half_life_days": 7.0,
+    "decay_interval_hours": 24,
+    "project_affinity_weight": 0.4,
+    "recency_weight": 0.35,
+    "frequency_weight": 0.25
+  },
+  "obsidian": {
+    "vault_path": "/path/to/obsidian/vault"
   }
 }
 ```
@@ -227,6 +280,13 @@ Runs in a background thread after every successful agent completion:
 ```bash
 pip install -r requirements.txt
 python main.py --add ~/code/myproject
+```
+
+Or install as a command:
+
+```bash
+make install
+vibe --add ~/code/myproject
 ```
 
 ### Tests
@@ -274,9 +334,3 @@ Full documentation for the supported coding agent CLIs is in `coding_agent_docum
 | `cursor.md` | Cursor `agent` CLI |
 | `codex.md` | OpenAI Codex CLI |
 | `claude_cli.md`, `claude_cmds.md`, `claude_env.md`, `claude_hook.md`, `claude_inter.md`, `claude_mcp.md`, `claude_plug.md`, `claude_tool.md`, `claude_ckpt.md` | Claude Code CLI |
-
----
-
-## Dead Code
-
-`unused/` contains the original gesture/voice/camera implementation. Not imported anywhere — safe to delete.

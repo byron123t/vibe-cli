@@ -35,19 +35,28 @@ vibe-cli is modal — like vim. Press a key to act, not to type.
 | `1` – `9` | Jump to project N |
 | `n` or `Enter` | Open prompt → launch agent |
 | `x` | Cancel last running agent |
-| `d` | Dismiss last agent widget |
+| `d` | Detach last agent widget |
 | `j` / `k` | Scroll agent list down / up |
 | `f` | Toggle file browser |
 | `e` | Toggle file editor (read-only) |
 | `i` | Enter edit mode in file editor |
 | `m` | Toggle memory / knowledge graph |
 | `t` | Toggle embedded terminal |
-| `r` | Run last shell command detected in agent output |
+| `r` | Open reattach menu (re-attach detached agents) |
+| `R` | Run last shell command from agent output |
 | `s` | Save file (edit mode only) |
-| `A` | Cycle agent type (Claude → Codex → Cursor) |
+| `A` | Cycle agent type (Claude → Codex → Cursor → OpenClaw) |
+| `E` | Cycle effort level |
 | `P` | Cycle permission mode (Safe → Accept Edits → Bypass) |
 | `G` | Toggle git auto-commit+push on/off |
+| `V` | Toggle verbose output default for new agents |
+| `B` | Import brain/memory folder into vault |
+| `c` | Toggle channels / inbox panel |
+| `O` | Toggle Obsidian vault panel |
 | `o` | Open a project directory (file picker) |
+| `ctrl+p` | Open command palette |
+| `ctrl+o` | Expand/collapse current agent output |
+| `ctrl+\` | Cycle permission mode |
 | `Backspace` / `,` | Back to command mode |
 | `q` | Quit |
 
@@ -89,6 +98,7 @@ Press `A` to cycle between:
 - **Claude** — runs `claude --print --output-format stream-json` (default)
 - **Codex** — runs OpenAI Codex CLI
 - **Cursor** — runs Cursor CLI
+- **OpenClaw** — runs OpenClaw CLI
 
 ### Permission modes
 
@@ -144,19 +154,30 @@ A vault linter runs automatically and writes broken links, orphan notes, and sta
 
 ```json
 {
+  "agent": { "type": "claude" },
   "claude": {
     "model": "claude-sonnet-4-6",
+    "max_tokens": 65536,
     "permission_mode": "accept_edits"
   },
   "vault": { "root": "vault" },
   "git": {
-    "auto_commit": true,
-    "commit_message_prefix": "[vibe-cli] "
+    "auto_commit": false,
+    "commit_message_prefix": "[VibeCLI] "
   },
   "ui": {
     "max_agents_per_project": 8,
     "suggestions_count": 4
-  }
+  },
+  "hooks": { "auto_docs": true },
+  "personalization": {
+    "recency_half_life_days": 7.0,
+    "decay_interval_hours": 24,
+    "project_affinity_weight": 0.4,
+    "recency_weight": 0.35,
+    "frequency_weight": 0.25
+  },
+  "obsidian": { "vault_path": "/path/to/obsidian/vault" }
 }
 ```
 

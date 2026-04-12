@@ -43,10 +43,10 @@ class TestSessionStore:
 
     def test_save_overwrites(self, store):
         s, _ = store
-        s.save({"version": 1, "data": "first"})
-        s.save({"version": 1, "data": "second"})
+        s.save({"version": 1, "global": {"ui_theme": "first-theme"}})
+        s.save({"version": 1, "global": {"ui_theme": "second-theme"}})
         loaded = s.load()
-        assert loaded["data"] == "second"
+        assert loaded["global"]["ui_theme"] == "second-theme"
 
     def test_load_invalid_json_returns_empty(self, store, tmp_path, monkeypatch):
         _, path = store
@@ -57,10 +57,12 @@ class TestSessionStore:
         assert isinstance(result, dict)
 
     def test_load_wrong_version_returns_empty(self, store):
-        s, _ = store
-        s.save({"version": 99, "data": "old"})
+        s, path = store
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump({"version": 99, "data": "old"}, f)
         result = s.load()
-        assert result == {}
+        assert result["global"]["ui_theme"] == "textual-dark"
+        assert result["projects"] == {}
 
     def test_save_complex_nested_state(self, store):
         s, _ = store
@@ -73,6 +75,42 @@ class TestSessionStore:
         s.save(state)
         loaded = s.load()
         assert loaded["projects"]["/path/to/proj"]["agents"][0]["prompt"] == "fix bug"
+
+    def test_patch_global_preserves_existing_projects(self, store):
+        s, _ = store
+        s.save({
+            "version": 1,
+            "global": {"ui_theme": "textual-dark"},
+            "projects": {
+                "/tmp/project": {
+                    "agents": [{"prompt": "fix bug", "project_path": "/tmp/project"}]
+                }
+            },
+        })
+        s.patch_global(ui_theme="dracula")
+        loaded = s.load()
+        assert loaded["global"]["ui_theme"] == "dracula"
+        assert "/tmp/project" in loaded["projects"]
+
+    def test_load_normalizes_partial_state(self, store):
+        _, path = store
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump({"version": 1, "global": {"ui_theme": "dracula"}}, f)
+        loaded = SessionStore().load()
+        assert loaded["global"]["ui_theme"] == "dracula"
+        assert loaded["projects"] == {}
+        assert loaded["prompt_history"] == []
+
+    def test_global_without_ui_theme_omits_key(self, store):
+        """Old sessions had no ui_theme; config.json must win — do not inject default."""
+        _, path = store
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(
+                {"version": 1, "global": {"show_files": True, "show_editor": False}},
+                f,
+            )
+        loaded = SessionStore().load()
+        assert "ui_theme" not in loaded["global"]
 
 
 class TestCapOutput:
