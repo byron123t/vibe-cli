@@ -384,6 +384,148 @@ def _short_model(model: str) -> str:
 
 
 # ---------------------------------------------------------------------------
+# ExpandingInput — auto-growing TextArea with Input-compatible API
+# ---------------------------------------------------------------------------
+
+class ExpandingInput(TextArea):
+    """Multi-line text input that grows vertically as text wraps.
+
+    Enter submits; Shift+Enter inserts a newline.  Provides .value, .placeholder,
+    and .action_end() so existing call-sites need minimal changes.
+    """
+
+    BINDINGS = [
+        Binding("enter",       "submit_text",  show=False, priority=True),
+        Binding("shift+enter", "newline",      show=False, priority=True),
+        Binding("tab",         "tab_press",    show=False, priority=True),
+        Binding("shift+up",    "history_up",   show=False, priority=True),
+        Binding("shift+down",  "history_down", show=False, priority=True),
+    ]
+
+    DEFAULT_CSS = """
+    ExpandingInput {
+        height: auto;
+        min-height: 3;
+        max-height: 12;
+        background: $background;
+        color: $text;
+        padding: 0 1;
+        scrollbar-size: 0 0;
+        border: tall $accent;
+    }
+    ExpandingInput:focus { border: tall $accent; }
+    ExpandingInput .text-area--gutter { display: none; width: 0; }
+    ExpandingInput .text-area--cursor-line { background: transparent; }
+    ExpandingInput .text-area--selection { background: $accent 35%; }
+    """
+
+    class Submitted(Message):
+        def __init__(self, widget: "ExpandingInput", value: str) -> None:
+            self.input = widget   # named 'input' for compatibility with existing handlers
+            self.value = value
+            super().__init__()
+
+        @property
+        def control(self) -> "ExpandingInput":
+            return self.input
+
+    class Blurred(Message):
+        def __init__(self, widget: "ExpandingInput") -> None:
+            self.input = widget
+            super().__init__()
+
+        @property
+        def control(self) -> "ExpandingInput":
+            return self.input
+
+    class TabPressed(Message):
+        def __init__(self, widget: "ExpandingInput") -> None:
+            self.input = widget
+            super().__init__()
+
+        @property
+        def control(self) -> "ExpandingInput":
+            return self.input
+
+    class HistoryBrowse(Message):
+        def __init__(self, widget: "ExpandingInput", direction: str) -> None:
+            self.input = widget
+            self.direction = direction  # "up" or "down"
+            super().__init__()
+
+        @property
+        def control(self) -> "ExpandingInput":
+            return self.input
+
+    def __init__(
+        self,
+        placeholder: str = "",
+        *,
+        id: str | None = None,
+        classes: str | None = None,
+        **kwargs,
+    ) -> None:
+        super().__init__(
+            text="",
+            language=None,
+            theme="css",
+            show_line_numbers=False,
+            soft_wrap=True,
+            id=id,
+            classes=classes,
+        )
+        self._placeholder = placeholder
+
+    # ── Input-compatible API ────────────────────────────────────────────────
+
+    @property
+    def value(self) -> str:
+        return self.text.rstrip("\n")
+
+    @value.setter
+    def value(self, v: str) -> None:
+        self.load_text(v)
+
+    @property
+    def placeholder(self) -> str:
+        return self._placeholder
+
+    @placeholder.setter
+    def placeholder(self, v: str) -> None:
+        self._placeholder = v
+
+    def action_end(self) -> None:
+        """Move cursor to end of last line (mirrors Input.action_end)."""
+        lines = self.text.split("\n")
+        last_row = max(0, len(lines) - 1)
+        last_col = len(lines[last_row])
+        self.move_cursor((last_row, last_col))
+
+    # ── actions ─────────────────────────────────────────────────────────────
+
+    def action_submit_text(self) -> None:
+        val = self.text.rstrip("\n").strip()
+        if val:
+            self.post_message(self.Submitted(self, val))
+
+    def action_newline(self) -> None:
+        self.insert("\n")
+
+    def action_tab_press(self) -> None:
+        self.post_message(self.TabPressed(self))
+
+    def action_history_up(self) -> None:
+        self.post_message(self.HistoryBrowse(self, "up"))
+
+    def action_history_down(self) -> None:
+        self.post_message(self.HistoryBrowse(self, "down"))
+
+    def _on_blur(self, event) -> None:
+        super()._on_blur(event)
+        self.post_message(self.Blurred(self))
+
+
+# ---------------------------------------------------------------------------
 # AgentWidget — one Claude session
 # ---------------------------------------------------------------------------
 
@@ -435,7 +577,9 @@ class AgentWidget(Static):
     .agent-status-done    { color: $success;  height: 1; padding: 0 1; }
     .agent-status-error   { color: $error;    height: 1; padding: 0 1; }
     .agent-reply {
-        height: 3;
+        height: auto;
+        min-height: 3;
+        max-height: 8;
         border: tall $accent-darken-2;
         background: $surface;
         display: none;
@@ -500,7 +644,7 @@ class AgentWidget(Static):
         yield SelectableLog("", read_only=True, id=f"agent-ta-{sid}", classes="agent-ta")
         yield Label("⟳ Running…", classes="agent-status-running",
                     id=f"agent-status-{sid}")
-        yield Input(
+        yield ExpandingInput(
             placeholder="↵ reply… (/btw context · /compact · follow-up)",
             id=f"agent-reply-{sid}",
             classes="agent-reply",
@@ -599,7 +743,7 @@ class AgentWidget(Static):
         # (it checks reply.display == False; _mark_complete re-shows it when done).
         sid = self.session.session_id
         try:
-            self.query_one(f"#agent-reply-{sid}", Input).display = False
+            self.query_one(f"#agent-reply-{sid}", ExpandingInput).display = False
         except Exception:
             pass
         self._ticker()
@@ -690,21 +834,21 @@ class AgentWidget(Static):
             self._ta.scroll_end(animate=False)
 
         # Show reply input (perm indicator is already visible from on_mount)
-        reply_input = self.query_one(f"#agent-reply-{sid}", Input)
+        reply_input = self.query_one(f"#agent-reply-{sid}", ExpandingInput)
         reply_input.display = True
 
         self.post_message(self.Complete(self, exit_code))
 
     # ------------------------------------------------------------------ slash hint
 
-    @on(Input.Changed)
-    def _reply_changed(self, event: Input.Changed) -> None:
+    @on(TextArea.Changed)
+    def _reply_changed(self, event: TextArea.Changed) -> None:
         """Show passive slash-command hint while user types / commands."""
-        if not (event.input.id or "").startswith("agent-reply-"):
+        if not (event.text_area.id or "").startswith("agent-reply-"):
             return
         if self._slash_hint is None:
             return
-        value = event.value
+        value = event.text_area.text.rstrip("\n")
         if value.startswith("/"):
             hint = _slash_hint_text(value.split()[0] if value.split() else value)
             if hint:
@@ -715,8 +859,8 @@ class AgentWidget(Static):
 
     # ------------------------------------------------------------------ reply / multi-turn
 
-    @on(Input.Submitted)
-    def _reply_submitted(self, event: Input.Submitted) -> None:
+    @on(ExpandingInput.Submitted)
+    def _reply_submitted(self, event: ExpandingInput.Submitted) -> None:
         if not (event.input.id or "").startswith("agent-reply-"):
             return
         reply = event.value.strip()
@@ -761,7 +905,7 @@ class AgentWidget(Static):
             self._status.add_class("agent-status-running")
 
         # Hide reply input while running (perm indicator stays visible)
-        reply_input = self.query_one(f"#agent-reply-{sid}", Input)
+        reply_input = self.query_one(f"#agent-reply-{sid}", ExpandingInput)
         reply_input.display = False
 
         # Use the stored agent type — never use type(self._active_session) since
@@ -1042,6 +1186,17 @@ class AgentPanel(Static, can_focus=True):
             return list(self.query_one(f"#{cid}", ScrollableContainer).query(AgentWidget))
         except Exception:
             return []
+
+    def pop_project_state(self, project_name: str) -> list[dict]:
+        """Snapshot all agent states for project_name, remove its DOM container, return states."""
+        agents = self.get_agents_for_project(project_name)
+        states = [w.to_state() for w in agents]
+        cid = self._container_id(project_name)
+        try:
+            self.query_one(f"#{cid}", ScrollableContainer).remove()
+        except Exception:
+            pass
+        return states
 
     def restore_agents(
         self,
@@ -1858,7 +2013,14 @@ class ProjectTabBar(Static):
                 old.label = btn.label
                 old.set_class("active" in btn.classes, "active")
             else:
-                self.mount(btn)
+                if btn.id == "ptab-add":
+                    self.mount(btn)          # ⊕ always goes last
+                else:
+                    # Mount project tab before the ⊕ button so it stays rightmost
+                    try:
+                        self.mount(btn, before=self.query_one("#ptab-add", Button))
+                    except Exception:
+                        self.mount(btn)
 
     def on_mount(self) -> None:
         self.query_one("#tb-hint", Label).display = not bool(self._projects)
@@ -1915,13 +2077,9 @@ class PromptBar(Static):
         padding: 0 0;
     }
     .pb-input {
-        height: 3;
         background: $background;
-        border: tall $accent;
         color: $text;
-        padding: 0 1;
     }
-    .pb-input:focus { border: tall $accent; }
     .pb-slash-hint {
         height: 1;
         padding: 0 1;
@@ -1958,10 +2116,10 @@ class PromptBar(Static):
     def compose(self) -> ComposeResult:
         yield Static("", id="pb-auto-sugg",   classes="pb-auto-sugg")
         yield Static("", id="pb-manual-sugg", classes="pb-manual-sugg")
-        inp = Input(
+        inp = ExpandingInput(
             placeholder=(
-                "› n or Enter to focus · type prompt · Tab=cycle · "
-                "ctrl+6…0=save shortcut · Escape=back"
+                "› n or Enter to focus · type prompt · Shift+Enter=newline · "
+                "Tab=cycle · ctrl+6…0=save shortcut · Escape=back"
             ),
             id="pb-input",
             classes="pb-input",
@@ -1996,7 +2154,7 @@ class PromptBar(Static):
     # ── public API ───────────────────────────────────────────────────────────
 
     def focus_input(self) -> None:
-        inp = self.query_one("#pb-input", Input)
+        inp = self.query_one("#pb-input", ExpandingInput)
         inp.can_focus = True   # re-enable so .focus() succeeds; restored on blur
         inp.focus()
         self._sugg_idx = -1
@@ -2005,18 +2163,24 @@ class PromptBar(Static):
         """Clicking anywhere on the prompt bar activates the input."""
         self.focus_input()
 
-    @on(Input.Blurred, "#pb-input")
+    @on(ExpandingInput.Blurred, "#pb-input")
     def _input_blurred(self, _event) -> None:
         """Exclude from tab cycle as soon as focus leaves the input."""
-        self.query_one("#pb-input", Input).can_focus = False
+        # If the OS took focus away from the terminal (alt-tab etc.), don't
+        # disable can_focus — Textual will restore focus here via AppFocus with
+        # from_app_focus=True, which skips select-all.  Setting can_focus=False
+        # would prevent that restoration and strand the user in command mode.
+        if not self.app.app_focus:
+            return
+        self.query_one("#pb-input", ExpandingInput).can_focus = False
         hint = self.query_one("#pb-slash-hint", Static)
         hint.display = False
 
-    @on(Input.Changed, "#pb-input")
-    def _pb_input_changed(self, event: Input.Changed) -> None:
+    @on(TextArea.Changed, "#pb-input")
+    def _pb_input_changed(self, event: TextArea.Changed) -> None:
         """Show passive slash-command hint while user types / commands."""
         hint = self.query_one("#pb-slash-hint", Static)
-        value = event.value
+        value = event.text_area.text.rstrip("\n")
         if value.startswith("/"):
             text = _slash_hint_text(value.split()[0] if value.split() else value)
             if text:
@@ -2028,7 +2192,7 @@ class PromptBar(Static):
     def fill_suggestion(self, idx: int) -> None:
         """Fill auto suggestion[idx] (0-based) into the input and focus it."""
         if idx < len(self.suggestions):
-            inp = self.query_one("#pb-input", Input)
+            inp = self.query_one("#pb-input", ExpandingInput)
             inp.can_focus = True
             inp.value = self.suggestions[idx]
             inp.focus()
@@ -2039,7 +2203,7 @@ class PromptBar(Static):
         """Fill manual shortcut slot (0-based, maps to keys 6-0) into the input."""
         text = (self.manual_shortcuts or [""] * 5)[slot] if slot < 5 else ""
         if text:
-            inp = self.query_one("#pb-input", Input)
+            inp = self.query_one("#pb-input", ExpandingInput)
             inp.can_focus = True
             inp.value = text
             inp.focus()
@@ -2047,7 +2211,7 @@ class PromptBar(Static):
             self._sugg_idx = -1
 
     def current_input_text(self) -> str:
-        return self.query_one("#pb-input", Input).value
+        return self.query_one("#pb-input", ExpandingInput).value
 
     def update_perm_indicator(self, mode: str, project: str = "") -> None:
         """Update the inline permission indicator below the prompt input."""
@@ -2057,25 +2221,20 @@ class PromptBar(Static):
 
     # ── key handling ─────────────────────────────────────────────────────────
 
-    def on_input_key(self, event: Key) -> None:
-        """Intercept Tab and Escape inside the Input widget."""
-        if event.key == "tab":
-            self._cycle_suggestion()
-            event.prevent_default()
-            event.stop()
-        elif event.key == "escape":
-            pass   # let it bubble to App
+    @on(ExpandingInput.TabPressed, "#pb-input")
+    def _tab_pressed(self, _event) -> None:
+        self._cycle_suggestion()
 
     def _cycle_suggestion(self) -> None:
         if not self.suggestions:
             return
         self._sugg_idx = (self._sugg_idx + 1) % len(self.suggestions)
-        inp = self.query_one("#pb-input", Input)
+        inp = self.query_one("#pb-input", ExpandingInput)
         inp.value = self.suggestions[self._sugg_idx]
         inp.action_end()
 
-    @on(Input.Submitted, "#pb-input")
-    def _submitted(self, event: Input.Submitted) -> None:
+    @on(ExpandingInput.Submitted, "#pb-input")
+    def _submitted(self, event: ExpandingInput.Submitted) -> None:
         prompt = event.value.strip()
         if prompt:
             self.post_message(PromptSubmitted(prompt))
@@ -2561,7 +2720,7 @@ class ShortcutsBar(Static):
         ("n/↵",    "new agent"),
         ("⇧A",     "cycle agent"),
         ("⇧P",     "permissions"),
-        ("⇧E",     "effort"),
+        ("⇧W",     "close tab"),
         ("] [",    "projects"),
         ("d",      "detach"),
         ("r",      "reattach"),

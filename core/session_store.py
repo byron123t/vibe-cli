@@ -31,6 +31,7 @@ MAX_OUTPUT_LINES = 500
 MAX_PROMPT_HISTORY = 500
 
 DEFAULT_THEME = "textual-dark"
+DEFAULT_REDIS_URL = "redis://localhost:6379/0"
 REDIS_KEY = "vibe:session"
 
 DEFAULT_GLOBAL_STATE = {
@@ -69,11 +70,20 @@ class SessionStore:
     redis_url:
         Redis connection URL (default ``redis://localhost:6379/0``).
         Pass ``None`` to disable Redis entirely.
+    redis_key:
+        Redis key used to store the session (default ``"vibe:session"``).
+        Override to isolate from other vibe installations on the same server.
     """
 
-    def __init__(self, path: str | None = None, redis_url: str | None = "redis://localhost:6379/0") -> None:
+    def __init__(
+        self,
+        path: str | None = None,
+        redis_url: str | None = DEFAULT_REDIS_URL,
+        redis_key: str = REDIS_KEY,
+    ) -> None:
         self.path = path or SESSION_FILE
         self._redis = None
+        self._redis_key = redis_key or REDIS_KEY
         if redis_url:
             self._redis = _try_connect_redis(redis_url)
 
@@ -89,6 +99,7 @@ class SessionStore:
             "global": copy.deepcopy(DEFAULT_GLOBAL_STATE),
             "projects": {},
             "detached": {},
+            "closed_projects": {},
             "prompt_history": [],
         }
 
@@ -173,6 +184,19 @@ class SessionStore:
                 ]
             base["detached"] = normalized_detached
 
+        closed_projects = state.get("closed_projects", {})
+        if isinstance(closed_projects, dict):
+            normalized_closed: dict[str, list[dict[str, Any]]] = {}
+            for project_path, agent_states in closed_projects.items():
+                if not isinstance(project_path, str) or not project_path:
+                    continue
+                if not isinstance(agent_states, list):
+                    continue
+                normalized_closed[project_path] = [
+                    self._normalize_agent(agent) for agent in agent_states if isinstance(agent, dict)
+                ]
+            base["closed_projects"] = normalized_closed
+
         prompt_history = state.get("prompt_history", [])
         if isinstance(prompt_history, list):
             base["prompt_history"] = [
@@ -218,7 +242,7 @@ class SessionStore:
         if self._redis is None:
             return
         try:
-            self._redis.set(REDIS_KEY, json.dumps(state))
+            self._redis.set(self._redis_key, json.dumps(state))
         except Exception:
             pass
 
@@ -226,7 +250,7 @@ class SessionStore:
         if self._redis is None:
             return None
         try:
-            data = self._redis.get(REDIS_KEY)
+            data = self._redis.get(self._redis_key)
             if data is None:
                 return None
             parsed = json.loads(data)

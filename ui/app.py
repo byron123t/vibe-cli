@@ -19,7 +19,7 @@ Command mode keys
   t               toggle terminal panel
   r               open reattach menu
   A               cycle agent type (Claude → Codex → Cursor → OpenClaw)
-  E               cycle effort level
+  W               close current project tab
   P               cycle permission mode
   ctrl+p          open command palette
   q               quit
@@ -144,6 +144,7 @@ from ui.widgets import (
     StatusBar,
     ShortcutsBar,
     _audio_annotation_path,
+    ExpandingInput,
 )
 from ui.app_slash import _SlashCommandMixin
 
@@ -182,7 +183,7 @@ class VibeCLIApp(_SlashCommandMixin, App[None]):
         Binding("r",     "reattach_menu",    "Reattach"),
         Binding("c",     "toggle_inbox",     "Channels"),
         Binding("O",     "toggle_obsidian",  "Obsidian", show=False),
-        Binding("E",     "cycle_effort",        "Effort"),
+        Binding("W",     "close_project",       "Close Tab", show=False),
         Binding("B",     "import_brain",        "Import Brain"),
         Binding("G",              "toggle_git_commit",     "Git Auto-Commit",             show=False),
         Binding("V",              "toggle_verbose_default","Verbose Output (new agents)", show=False),
@@ -204,8 +205,10 @@ class VibeCLIApp(_SlashCommandMixin, App[None]):
 
         vault_root   = config.get("vault", {}).get("root", "vault")
         self._vault  = MemoryVault(vault_root)
-        redis_url = config.get("session", {}).get("redis_url", "redis://localhost:6379/0")
-        self._session_store = SessionStore(session_path_for_vault(self._vault.root), redis_url=redis_url)
+        _sess_cfg  = config.get("session", {})
+        redis_url  = _sess_cfg.get("redis_url",  "redis://localhost:6379/0")
+        redis_key  = _sess_cfg.get("redis_key",  "vibe:session")
+        self._session_store = SessionStore(session_path_for_vault(self._vault.root), redis_url=redis_url, redis_key=redis_key)
         # True once startup restore is complete; watch_theme only persists after this point.
         self._session_ready: bool = False
 
@@ -261,7 +264,8 @@ class VibeCLIApp(_SlashCommandMixin, App[None]):
         self._show_terminal = False
         self._show_inbox    = False
         self._last_command: str = ""
-        self._detached: dict[str, list[dict]] = {}  # project_path → list of detached agent states
+        self._detached: dict[str, list[dict]] = {}        # project_path → detached agent states
+        self._closed_projects: dict[str, list[dict]] = {}  # project_path → closed-tab agent states
 
         # Manual prompt shortcuts for keys [6]-[0] — 5 slots, loaded from vault
         self._manual_shortcuts: list[str] = self._load_manual_shortcuts(vault_root)
@@ -406,8 +410,10 @@ class VibeCLIApp(_SlashCommandMixin, App[None]):
         key      = event.key
         char     = event.character or ""
         focused  = self.focused
-        in_input = isinstance(focused, Input)
-        in_edit  = isinstance(focused, TextArea) and not getattr(focused, "read_only", True)
+        in_input = isinstance(focused, (Input, ExpandingInput))
+        in_edit  = (isinstance(focused, TextArea)
+                    and not isinstance(focused, ExpandingInput)
+                    and not getattr(focused, "read_only", True))
         in_pty   = isinstance(focused, PTYWidget)
 
         # ── PTY focused: PTYWidget.on_key routes keys to the shell and stops
@@ -455,8 +461,8 @@ class VibeCLIApp(_SlashCommandMixin, App[None]):
             event.stop()
             return
 
-        # ── up/down (while typing): browse prompt history ──────────────────
-        if in_input and key in ("up", "down") and isinstance(focused, Input):
+        # ── up/down (while typing): browse prompt history (plain Input only) ─
+        if in_input and key in ("up", "down") and isinstance(focused, Input) and not isinstance(focused, ExpandingInput):
             iid = focused.id or ""
             if iid == "pb-input" or iid.startswith("agent-reply-"):
                 self._browse_input_history(key, focused)
@@ -517,9 +523,9 @@ class VibeCLIApp(_SlashCommandMixin, App[None]):
             event.stop()
             return
 
-        # ── E (shift+e): cycle effort level ──────────────────────────────
-        if char == "E":
-            self.action_cycle_effort()
+        # ── W (shift+w): close current project tab ───────────────────────
+        if char == "W":
+            self.action_close_project()
             event.stop()
             return
 
@@ -536,10 +542,6 @@ class VibeCLIApp(_SlashCommandMixin, App[None]):
     def _exit_to_command(self) -> None:
         """Return keyboard focus to the agent panel (command mode)."""
         self._open_project_mode = False
-        pb = self.query_one("#prompt-bar", PromptBar)
-        pb.query_one("#pb-input", Input).placeholder = (
-            "› n or Enter to focus · type prompt · Tab=cycle · 1-4=fill suggestion"
-        )
         self.query_one("#agent-panel", AgentPanel).focus()
 
     # ------------------------------------------------------------------ input history
@@ -552,6 +554,12 @@ class VibeCLIApp(_SlashCommandMixin, App[None]):
         if self._prompt_history and self._prompt_history[-1] == t:
             return
         self._prompt_history.append(t)
+
+    @on(ExpandingInput.HistoryBrowse)
+    def _expanding_history_browse(self, event: ExpandingInput.HistoryBrowse) -> None:
+        iid = event.input.id or ""
+        if iid == "pb-input" or iid.startswith("agent-reply-"):
+            self._browse_input_history(event.direction, event.input)
 
     def _browse_input_history(self, key: str, inp: "Input") -> None:
         """Move through history for *inp* based on *key* ('up' or 'down')."""
@@ -703,6 +711,24 @@ class VibeCLIApp(_SlashCommandMixin, App[None]):
         self._pm.prev_project()
         self._on_project_changed()
 
+    def action_close_project(self) -> None:
+        """Close the active tab, preserving its agent session for when it's reopened."""
+        if len(self._pm.projects) <= 1:
+            self.notify("Cannot close the last project tab.", severity="warning", timeout=2)
+            return
+        proj = self._pm.active
+        if proj is None:
+            return
+        # Snapshot all agent states and remove the DOM container before the project
+        # is removed from _pm so project.name / project.path are still valid.
+        ap = self.query_one("#agent-panel", AgentPanel)
+        states = ap.pop_project_state(proj.name)
+        if states:
+            self._closed_projects[proj.path] = states
+        self._pm.remove_project(self._pm.active_idx)
+        self._on_project_changed()
+        self._save_session()
+
     def action_open_project(self) -> None:
         """Push the directory-picker modal; result is a path string, ssh dict, or None."""
         active = self._pm.active
@@ -719,6 +745,7 @@ class VibeCLIApp(_SlashCommandMixin, App[None]):
                     proj = self._pm.add_ssh_project(path, ssh_info)
                     self._pm.set_active(len(self._pm.projects) - 1)
                     self._on_project_changed()
+                    self._restore_closed_project(path)
                     host = ssh_info.get("host", "?")
                     self.notify(f"Opened remote: {proj.name} ({host})", timeout=4)
                 else:
@@ -729,6 +756,7 @@ class VibeCLIApp(_SlashCommandMixin, App[None]):
                     self._pm.add_project(path)
                     self._pm.set_active(len(self._pm.projects) - 1)
                     self._on_project_changed()
+                    self._restore_closed_project(path)
                     self.notify(f"Opened: {self._pm.active.name}", timeout=3)
                 else:
                     self.notify(f"Not a valid directory: {path}", severity="error", timeout=5)
@@ -1153,6 +1181,18 @@ class VibeCLIApp(_SlashCommandMixin, App[None]):
         self._refresh_suggestions()
         self.query_one("#agent-panel", AgentPanel).focus()
         self._session_store.patch_global(active_project_idx=self._pm.active_idx)
+
+    def _restore_closed_project(self, path: str) -> None:
+        """If path was previously closed, restore its agent session into the active slot."""
+        saved = self._closed_projects.pop(path, None)
+        if not saved:
+            return
+        active = self._pm.active
+        if active is None:
+            return
+        ap = self.query_one("#agent-panel", AgentPanel)
+        ap.restore_agents(active.name, saved, self._vault)
+        self._save_session()
 
     @on(FileBrowserPanel.FileSelected)
     def _file_browser_selected(self, event: FileBrowserPanel.FileSelected) -> None:
@@ -1825,7 +1865,10 @@ class VibeCLIApp(_SlashCommandMixin, App[None]):
         self._ui_theme = theme
         if not getattr(self, "_session_ready", False):
             return
-        self._session_store.patch_global(ui_theme=theme)
+        try:
+            self._session_store.patch_global(ui_theme=theme)
+        except Exception:
+            pass  # persistence failure must not interrupt theme application
 
     def _set_theme(self, name: str) -> None:
         """Switch the app theme live and persist it."""
@@ -2077,6 +2120,7 @@ class VibeCLIApp(_SlashCommandMixin, App[None]):
             },
             "projects": projects_state,
             "detached": self._detached,
+            "closed_projects": self._closed_projects,
             "prompt_history": self._prompt_history[-500:],  # cap to 500 entries
         }
         self._session_store.save(state)
@@ -2124,8 +2168,9 @@ class VibeCLIApp(_SlashCommandMixin, App[None]):
         _proj_r = os.path.basename(_active_r.path.rstrip("/")) if _active_r else ""
         self.query_one("#prompt-bar", PromptBar).update_perm_indicator(self._perm_mode, _proj_r)
 
-        # Restore detached agents
-        self._detached = state.get("detached", {})
+        # Restore detached and closed-project agent buckets
+        self._detached         = state.get("detached", {})
+        self._closed_projects  = state.get("closed_projects", {})
 
         # Restore agents per project
         ap      = self.query_one("#agent-panel", AgentPanel)

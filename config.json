@@ -10,6 +10,10 @@
   "vault": {
     "root": "vault"
   },
+  "session": {
+    "redis_url": "redis://localhost:6379/0",
+    "redis_key": "vibe:session"
+  },
   "git": {
     "auto_commit": false,
     "commit_message_prefix": "[VibeCLI] "

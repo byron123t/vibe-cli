@@ -45,6 +45,13 @@ class DirectoryPickerScreen(ModalScreen):
     #dp-tree    { height: 1fr; border: solid $primary-darken-2; margin: 1 0; }
     #dp-input   { height: 3; border: tall $accent; }
     #dp-footer  { height: 1; color: $text-muted; }
+    #dp-up-row  { height: 1; margin-bottom: 0; layout: horizontal; }
+    #dp-up-btn  {
+        height: 1; min-width: 8; padding: 0 1;
+        background: $panel-darken-1; color: $text-muted;
+        border: none; content-align: left middle;
+    }
+    #dp-up-btn:hover { color: $text; background: $panel; }
     #dp-ssh-pane { height: 1fr; }
     .dp-ssh-label { color: $text-muted; margin-top: 1; height: 1; }
     .dp-ssh-input { margin-bottom: 0; border: tall $primary-darken-2; }
@@ -58,8 +65,8 @@ class DirectoryPickerScreen(ModalScreen):
 
     def __init__(self, start_path: str | None = None, **kwargs) -> None:
         super().__init__(**kwargs)
-        self._tree_root  = os.path.expanduser("~")
-        self._input_init = start_path or self._tree_root
+        self._tree_root  = start_path or os.path.expanduser("~")
+        self._input_init = self._tree_root
         self._ssh_mode   = False   # False = local, True = SSH
         self._syncing_input = False  # True while node highlight is writing the input
 
@@ -75,6 +82,8 @@ class DirectoryPickerScreen(ModalScreen):
                     " OPEN PROJECT  [dim]↑↓ tree · Enter = open · type path · Escape = cancel[/dim]",
                     id="dp-header",
                 )
+                with Horizontal(id="dp-up-row"):
+                    yield Button("↑ Up", id="dp-up-btn")
                 yield DirectoryTree(self._tree_root, id="dp-tree")
                 yield Input(
                     value=self._input_init,
@@ -113,6 +122,16 @@ class DirectoryPickerScreen(ModalScreen):
             self._set_mode(ssh=False)
         elif bid == "dp-tab-ssh":
             self._set_mode(ssh=True)
+        elif bid == "dp-up-btn":
+            self._go_up()
+
+    def _go_up(self) -> None:
+        current = os.path.expanduser(self.query_one("#dp-input", Input).value.strip())
+        parent  = str(Path(current).parent)
+        if parent == current:   # already at filesystem root
+            return
+        self.query_one("#dp-input", Input).value = parent
+        self.query_one("#dp-tree", DirectoryTree).path = Path(parent)
 
     def _set_mode(self, ssh: bool) -> None:
         self._ssh_mode = ssh
